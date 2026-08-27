@@ -29,6 +29,18 @@ from google.genai import types
 SOURCE_DIR = Path(__file__).resolve().parent
 
 
+def _dir_is_writable(path: Path) -> bool:
+    """检测目录是否可写（macOS 拖进 /Applications 后为只读）。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except Exception:
+        return False
+
+
 def resolve_base_dir() -> Path:
     """兼容源码、Windows EXE 和 macOS App 的工作目录。"""
     if not getattr(sys, "frozen", False):
@@ -37,8 +49,19 @@ def resolve_base_dir() -> Path:
     executable_path = Path(sys.executable).resolve()
     executable_posix = executable_path.as_posix()
     if sys.platform == "darwin" and ".app/Contents/MacOS/" in executable_posix:
-        return executable_path.parent.parent.parent.parent
-    return executable_path.parent
+        candidate = executable_path.parent.parent.parent.parent
+    else:
+        candidate = executable_path.parent
+
+    # 安装目录只读（典型：macOS 把 .app 拖进 /Applications）时，回退到用户主目录下的可写目录。
+    if _dir_is_writable(candidate):
+        return candidate
+    fallback = Path.home() / "GeminiImageTool"
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return fallback
 
 
 BASE_DIR = resolve_base_dir()
