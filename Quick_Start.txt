@@ -1,0 +1,13 @@
+GeminiImageTool Windows 便携版
+
+使用方法：
+1. 双击 Start.bat
+2. 浏览器会自动打开 http://127.0.0.1:7860
+3. 在页面顶部填写 Gemini API Key 即可使用
+
+可选：双击 Install_Shortcut.bat 在桌面创建快捷方式
+
+说明：
+- 本包已内置 Python 解释器，无需额外安装任何软件
+- 支持 Windows 10 / 11 (64位)
+- 如需代理，在程序页面的[设置]里填写代理地址

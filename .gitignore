@@ -1,0 +1,20 @@
+# ── 内置 Python 运行时（~281MB，可重新获取，不入库）──
+python/
+
+# ── 运行期数据与本机私密配置（含 API Key，切勿上传）──
+data/
+outputs/
+runtime/
+*.log
+
+# ── 卸载器 / 备份 / 编译产物 ──
+unins000.*
+*.bak
+*.bak_*
+__pycache__/
+*.pyc
+*.pyo
+
+# ── 打包临时目录与安装包产物 ──
+GemStage/
+*.exe
