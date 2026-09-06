@@ -1,5 +1,11 @@
 # Gemini 本地图像生成工具
 
+## Android 手机版本
+
+新增独立 Android 客户端：手机直接调用图像 API，支持多张参考图、连续生成、模型选择、提示词历史、保存相册和原图分享，无需开启电脑。
+
+安装和构建说明见 [android/README.md](android/README.md)。安卓代码位于 `android/`，原有 Windows / macOS 版不受影响。
+
 一个本地运行的 Gemini 图像生成工具，使用 `Gradio + google-genai` 实现，目标是替代 Google AI Studio 网页版的常用出图流程。
 
 ## 功能概览
