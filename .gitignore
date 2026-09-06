@@ -18,3 +18,12 @@ __pycache__/
 # ── 打包临时目录与安装包产物 ──
 GemStage/
 *.exe
+
+# Android local state and build products
+android/.gradle/
+android/**/build/
+android/local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
