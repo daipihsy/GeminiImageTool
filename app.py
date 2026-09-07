@@ -87,7 +87,16 @@ MAX_BATCH_ROW_INPUT_SIZE = 10
 MAX_BATCH_TOTAL_IMAGES = MAX_BATCH_ROWS * MAX_GENERATE_IMAGES
 MAX_REFERENCE_BYTES = 20 * 1024 * 1024
 TEST_MODEL_ID = "gemini-2.5-flash-lite"
-DEFAULT_RELAY_BASE_URL = "https://api.apiyi.com"
+API_PROTOCOL_GEMINI = "gemini"
+API_PROTOCOL_OPENAI_IMAGES = "openai_images"
+API_PROTOCOL_OPENAI_CHAT = "openai_chat"
+API_PROTOCOL_CHOICES = [
+    ("Gemini 原生（generateContent）", API_PROTOCOL_GEMINI),
+    ("OpenAI Images（/v1/images）", API_PROTOCOL_OPENAI_IMAGES),
+    ("OpenAI Chat 生图（/v1/chat/completions）", API_PROTOCOL_OPENAI_CHAT),
+]
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
+LEGACY_APIYI_BASE_URL = "https://api.apiyi.com"
 GPT_IMAGE_2_VIP_MODEL_ID = "gpt-image-2-vip"
 # “自适应”表示不向 API 传固定宽高比，交给 Prompt / 参考图决定画面比例。
 AUTO_ASPECT_RATIO = "自适应"
@@ -178,14 +187,14 @@ MODEL_OPTIONS = [
         "supports_image_search": False,
     },
     {
-        "label": "GPT-Image-2-VIP（gpt-image-2-vip）— APIYI，支持锁定尺寸",
+        "label": "GPT-Image-2-VIP（gpt-image-2-vip）— OpenAI Images 兼容",
         "value": GPT_IMAGE_2_VIP_MODEL_ID,
         "short_name": "GPT-Image-2-VIP",
         "native_sizes": {"1K", "2K", "4K"},
         "native_aspects": set(GPT_IMAGE_2_VIP_SIZES["2K"].keys()),
         "supports_google_search": False,
         "supports_image_search": False,
-        "api_kind": "apiyi_openai_image",
+        "api_kind": API_PROTOCOL_OPENAI_IMAGES,
     },
 ]
 MODEL_BY_ID = {item["value"]: item for item in MODEL_OPTIONS}
@@ -208,12 +217,7 @@ def is_probably_image_model(model_id: str) -> bool:
 
 
 def get_model_meta(model_id: str) -> dict[str, Any]:
-    """返回模型能力元数据。已知模型用内置配置；未知模型给保守但可用的默认值。
-
-    中转站模型更新很快，用户“检测可用模型”后可能选到内置列表里没有的新模型。
-    对未知模型：默认按 Gemini 原生图像协议处理，常见比例走原生、其余本地裁切，
-    分辨率超出即本地缩放；拿不准时用户可选“自适应”比例，届时完全不传约束参数。
-    """
+    """返回模型能力元数据；请求协议由用户设置决定，不再从模型名推断。"""
     if model_id in MODEL_BY_ID:
         return MODEL_BY_ID[model_id]
     lower = (model_id or "").lower()
@@ -226,7 +230,7 @@ def get_model_meta(model_id: str) -> dict[str, Any]:
         "native_aspects": {"1:1", "4:3", "3:4", "16:9", "9:16"},
         "supports_google_search": looks_gemini,
         "supports_image_search": False,
-        "api_kind": "gemini",
+        "api_kind": "auto",
     }
 
 
@@ -599,13 +603,49 @@ def normalize_proxy_url(proxy_url: str) -> str:
 
 
 def normalize_api_base_url(api_base_url: str) -> str:
-    """统一处理 Gemini Base URL，留空表示走 Google 官方端点。"""
+    """统一处理 Base URL；留空时由所选协议使用官方默认端点。"""
     raw = (api_base_url or "").strip()
     if not raw:
         return ""
     if "://" not in raw:
         raw = f"https://{raw}"
     return raw.rstrip("/")
+
+
+def normalize_gemini_base_url(api_base_url: str) -> str:
+    """Gemini SDK 单独接收 api_version，因此去掉用户可能填写的版本后缀。"""
+    return re.sub(
+        r"/v1(?:beta)?$",
+        "",
+        normalize_api_base_url(api_base_url),
+        flags=re.I,
+    )
+
+
+def normalize_api_protocol(api_protocol: str | None) -> str:
+    """规范协议配置，并兼容旧版缺少协议字段的配置。"""
+    value = (api_protocol or "").strip().lower()
+    aliases = {
+        "openai": API_PROTOCOL_OPENAI_IMAGES,
+        "openai_image": API_PROTOCOL_OPENAI_IMAGES,
+        "openai-images": API_PROTOCOL_OPENAI_IMAGES,
+        "chat": API_PROTOCOL_OPENAI_CHAT,
+        "openai-chat": API_PROTOCOL_OPENAI_CHAT,
+    }
+    value = aliases.get(value, value)
+    if value in {API_PROTOCOL_GEMINI, API_PROTOCOL_OPENAI_IMAGES, API_PROTOCOL_OPENAI_CHAT}:
+        return value
+    return API_PROTOCOL_GEMINI
+
+
+def protocol_display_name(api_protocol: str) -> str:
+    """协议的界面名称。"""
+    protocol = normalize_api_protocol(api_protocol)
+    return {
+        API_PROTOCOL_GEMINI: "Gemini 原生",
+        API_PROTOCOL_OPENAI_IMAGES: "OpenAI Images",
+        API_PROTOCOL_OPENAI_CHAT: "OpenAI Chat 生图",
+    }[protocol]
 
 
 def detect_windows_system_proxy_url() -> str:
@@ -687,17 +727,19 @@ def save_runtime_settings(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
+    api_protocol: str,
     output_root: str,
     backup_root: str,
     remember_api_key: bool,
 ) -> None:
-    """保存 API Key、代理、Base URL、输出目录和备份目录。"""
+    """保存 API Key、协议、代理、Base URL、输出目录和备份目录。"""
     write_json_file(
         CONFIG_PATH,
         {
             "api_key": normalize_api_key(api_key) if remember_api_key else "",
             "proxy_url": normalize_proxy_url(proxy_url),
             "api_base_url": normalize_api_base_url(api_base_url),
+            "api_protocol": normalize_api_protocol(api_protocol),
             "output_root": str(normalize_output_root(output_root)),
             "backup_root": str(normalize_backup_root(backup_root)),
         },
@@ -882,8 +924,13 @@ def get_initial_proxy_url() -> str:
 
 
 def get_initial_api_base_url() -> str:
-    """程序启动时预填 Base URL，留空表示仍走 Google 官方端点。"""
+    """程序启动时预填 Base URL。"""
     return normalize_api_base_url(str(load_config().get("api_base_url", "")).strip())
+
+
+def get_initial_api_protocol() -> str:
+    """程序启动时预填协议；旧版配置默认继续使用 Gemini。"""
+    return normalize_api_protocol(str(load_config().get("api_protocol", "")))
 
 
 def get_initial_output_root() -> str:
@@ -1212,7 +1259,7 @@ def get_creative_generate_button_update(api_key: str, prompt: str | None = None)
 def build_http_options_kwargs(proxy_url: str = "", api_base_url: str = "") -> dict[str, Any]:
     """统一构造 HTTP 配置，兼容官方端点和 Gemini 原生中转。"""
     clean_proxy = normalize_proxy_url(proxy_url) or detect_windows_system_proxy_url()
-    clean_base_url = normalize_api_base_url(api_base_url)
+    clean_base_url = normalize_gemini_base_url(api_base_url)
     http_options_kwargs: dict[str, Any] = {"timeout": REQUEST_TIMEOUT_MS}
     if clean_proxy:
         http_options_kwargs["client_args"] = {"proxy": clean_proxy}
@@ -1237,7 +1284,7 @@ def make_client(api_key: str, proxy_url: str = "", api_base_url: str = "") -> ge
 
 def make_request_http_options(api_base_url: str = "") -> types.HttpOptions:
     """单次请求统一超时配置。"""
-    clean_base_url = normalize_api_base_url(api_base_url)
+    clean_base_url = normalize_gemini_base_url(api_base_url)
     http_options_kwargs: dict[str, Any] = {"timeout": REQUEST_TIMEOUT_MS}
     if clean_base_url:
         http_options_kwargs["base_url"] = clean_base_url
@@ -1245,14 +1292,10 @@ def make_request_http_options(api_base_url: str = "") -> types.HttpOptions:
     return types.HttpOptions(**http_options_kwargs)
 
 
-def is_apiyi_openai_image_model(model_id: str) -> bool:
-    """是否为 APIYI OpenAI Images 兼容图像模型。"""
-    return get_model_meta(model_id).get("api_kind") == "apiyi_openai_image"
-
-
-def build_apiyi_openai_url(api_base_url: str, endpoint_path: str) -> str:
-    """构造 APIYI OpenAI 兼容接口地址，留空时默认走 api.apiyi.com。"""
-    base_url = normalize_api_base_url(api_base_url) or DEFAULT_RELAY_BASE_URL
+def build_openai_url(api_base_url: str, endpoint_path: str) -> str:
+    """构造 OpenAI 兼容接口地址；支持填写根域名或已经带 /v1 的地址。"""
+    base_url = normalize_api_base_url(api_base_url) or DEFAULT_OPENAI_BASE_URL
+    base_url = re.sub(r"/v1beta$", "", base_url.rstrip("/"), flags=re.I)
     if not base_url.rstrip("/").endswith("/v1"):
         base_url = f"{base_url.rstrip('/')}/v1"
     return f"{base_url.rstrip('/')}/{endpoint_path.lstrip('/')}"
@@ -1271,15 +1314,23 @@ def make_httpx_client(proxy_url: str = "") -> httpx.Client:
     return httpx.Client(**kwargs)
 
 
-def resolve_apiyi_openai_image_size(
+def resolve_openai_image_size(
     model_id: str,
     resolution: str,
     api_aspect_ratio: str | None,
 ) -> str:
-    """把界面里的比例/档位转换为 GPT-Image-2-VIP 的 size。"""
-    if model_id != GPT_IMAGE_2_VIP_MODEL_ID or not api_aspect_ratio:
+    """把界面比例转换为 OpenAI Images 常见 size；VIP 模型保留其扩展尺寸。"""
+    if not api_aspect_ratio:
         return "auto"
-    return GPT_IMAGE_2_VIP_SIZES.get(resolution, {}).get(api_aspect_ratio, "auto")
+    if model_id == GPT_IMAGE_2_VIP_MODEL_ID:
+        return GPT_IMAGE_2_VIP_SIZES.get(resolution, {}).get(api_aspect_ratio, "auto")
+    try:
+        width, height = (float(part) for part in api_aspect_ratio.split(":", 1))
+    except (TypeError, ValueError):
+        return "auto"
+    if abs(width - height) < 0.01:
+        return "1024x1024"
+    return "1536x1024" if width > height else "1024x1536"
 
 
 def extract_error_detail(payload: Any) -> str:
@@ -1310,46 +1361,90 @@ def parse_json_response(response: httpx.Response) -> dict[str, Any]:
 
     if response.status_code >= 400:
         detail = extract_error_detail(payload)
-        raise RuntimeError(f"APIYI HTTP {response.status_code}: {detail or response.text}")
+        raise RuntimeError(f"API HTTP {response.status_code}: {detail or response.text}")
     if not isinstance(payload, dict):
-        raise RuntimeError(f"APIYI 返回格式异常：{payload}")
+        raise RuntimeError(f"API 返回格式异常：{payload}")
     return payload
 
 
-def image_from_data_url(data_url: str) -> Image.Image:
+def image_from_data_url(data_url: str, keep_alpha: bool = False) -> Image.Image:
     """从 data URL 或裸 base64 字符串读取图片。"""
     payload = (data_url or "").strip()
     if "," in payload and payload.lower().startswith("data:"):
         payload = payload.split(",", 1)[1]
     if not payload:
-        raise RuntimeError("APIYI 返回了空的 b64_json 图片数据。")
-    image_bytes = base64.b64decode(payload)
-    return Image.open(BytesIO(image_bytes)).convert("RGB")
+        raise RuntimeError("API 返回了空的图片数据。")
+    try:
+        image_bytes = base64.b64decode(payload)
+    except Exception as exc:
+        raise RuntimeError("API 返回的图片 base64 数据无法解析。") from exc
+    image = Image.open(BytesIO(image_bytes))
+    return image.convert("RGBA") if keep_alpha and image.mode in ("RGBA", "LA", "P") else image.convert("RGB")
 
 
-def extract_apiyi_openai_image(payload: dict[str, Any], client: httpx.Client) -> Image.Image:
-    """解析 APIYI OpenAI Images 兼容接口返回的图片。"""
-    data = payload.get("data")
-    if not isinstance(data, list) or not data:
-        raise RuntimeError(f"APIYI 没有返回图片数据：{payload}")
+def find_image_payload(value: Any) -> str:
+    """兼容 OpenAI Images 及常见 Chat 中转返回，找到首张 base64/data URL/URL 图片。"""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower().startswith("data:image/"):
+            return text
+        markdown = re.search(r"!\[[^\]]*\]\((data:image/[^)]+|https?://[^)]+)\)", text, re.I)
+        return markdown.group(1).strip() if markdown else ""
+    if isinstance(value, list):
+        for item in value:
+            found = find_image_payload(item)
+            if found:
+                return found
+        return ""
+    if not isinstance(value, dict):
+        return ""
 
-    first = data[0]
-    if not isinstance(first, dict):
-        raise RuntimeError(f"APIYI 图片数据格式异常：{first}")
+    for key in ("b64_json", "image_base64", "base64"):
+        if value.get(key):
+            return str(value[key]).strip()
+    image_url = value.get("image_url")
+    if isinstance(image_url, str) and image_url.strip():
+        return image_url.strip()
+    if isinstance(image_url, dict) and image_url.get("url"):
+        return str(image_url["url"]).strip()
+    direct_url = str(value.get("url") or "").strip()
+    if direct_url.lower().startswith(("http://", "https://", "data:image/")):
+        return direct_url
 
-    if first.get("b64_json"):
-        return image_from_data_url(str(first["b64_json"]))
-
-    image_url = str(first.get("url") or "").strip()
-    if image_url:
-        response = client.get(image_url)
-        response.raise_for_status()
-        return Image.open(BytesIO(response.content)).convert("RGB")
-
-    raise RuntimeError(f"APIYI 返回结果里没有 url 或 b64_json：{first}")
+    # 按协议中最常见的容器顺序遍历，避免把普通文本或错误消息误认成图片。
+    for key in ("data", "images", "output", "choices", "message", "content", "result"):
+        if key in value:
+            found = find_image_payload(value[key])
+            if found:
+                return found
+    return ""
 
 
-def generate_apiyi_openai_image(
+def extract_openai_image(
+    payload: dict[str, Any],
+    client: httpx.Client,
+    keep_alpha: bool = False,
+) -> Image.Image:
+    """解析 OpenAI Images 和常见 OpenAI Chat 生图返回。"""
+    image_payload = find_image_payload(payload)
+    if not image_payload:
+        raise RuntimeError("接口请求成功，但返回结果中没有找到图片（支持 b64_json、data URL、url 和 message.images）。")
+    if image_payload.lower().startswith("data:image/") or not image_payload.lower().startswith(("http://", "https://")):
+        return image_from_data_url(image_payload, keep_alpha=keep_alpha)
+    response = client.get(image_payload)
+    response.raise_for_status()
+    image = Image.open(BytesIO(response.content))
+    return image.convert("RGBA") if keep_alpha and image.mode in ("RGBA", "LA", "P") else image.convert("RGB")
+
+
+def image_path_to_data_url(path: str) -> str:
+    """把本地参考图转成 Chat Completions 可接受的 data URL。"""
+    image_path = Path(path)
+    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    return f"data:{guess_mime_type(image_path)};base64,{encoded}"
+
+
+def generate_openai_image(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
@@ -1358,16 +1453,18 @@ def generate_apiyi_openai_image(
     reference_paths: list[str] | None,
     resolution: str,
     api_aspect_ratio: str | None,
+    keep_alpha: bool = False,
 ) -> Image.Image:
-    """调用 APIYI 的 OpenAI Images/Edits 兼容端点生成图片。"""
-    image_size = resolve_apiyi_openai_image_size(model_id, resolution, api_aspect_ratio)
+    """调用标准 OpenAI Images/Edits 兼容端点生成图片。"""
+    image_size = resolve_openai_image_size(model_id, resolution, api_aspect_ratio)
     headers = {"Authorization": f"Bearer {normalize_api_key(api_key)}"}
 
     with make_httpx_client(proxy_url) as client:
         if reference_paths:
+            image_field = "image" if model_id == GPT_IMAGE_2_VIP_MODEL_ID else "image[]"
             files = [
                 (
-                    "image",
+                    image_field,
                     (Path(path).name, Path(path).read_bytes(), guess_mime_type(Path(path))),
                 )
                 for path in reference_paths
@@ -1375,28 +1472,58 @@ def generate_apiyi_openai_image(
             data = {
                 "model": model_id,
                 "prompt": prompt,
-                "size": image_size,
-                "response_format": "b64_json",
             }
+            if image_size != "auto":
+                data["size"] = image_size
             response = client.post(
-                build_apiyi_openai_url(api_base_url, "/images/edits"),
+                build_openai_url(api_base_url, "/images/edits"),
                 headers=headers,
                 data=data,
                 files=files,
             )
         else:
+            body: dict[str, Any] = {"model": model_id, "prompt": prompt, "n": 1}
+            if image_size != "auto":
+                body["size"] = image_size
             response = client.post(
-                build_apiyi_openai_url(api_base_url, "/images/generations"),
+                build_openai_url(api_base_url, "/images/generations"),
                 headers={**headers, "Content-Type": "application/json"},
-                json={
-                    "model": model_id,
-                    "prompt": prompt,
-                    "size": image_size,
-                    "response_format": "b64_json",
-                },
+                json=body,
             )
 
-        return extract_apiyi_openai_image(parse_json_response(response), client)
+        return extract_openai_image(parse_json_response(response), client, keep_alpha=keep_alpha)
+
+
+def generate_openai_chat_image(
+    api_key: str,
+    proxy_url: str,
+    api_base_url: str,
+    model_id: str,
+    prompt: str,
+    reference_paths: list[str] | None,
+    keep_alpha: bool = False,
+) -> Image.Image:
+    """调用常见中转站的 OpenAI Chat Completions 生图扩展。"""
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for path in reference_paths or []:
+        content.append({"type": "image_url", "image_url": {"url": image_path_to_data_url(path)}})
+    body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": content}],
+        "modalities": ["text", "image"],
+        "stream": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {normalize_api_key(api_key)}",
+        "Content-Type": "application/json",
+    }
+    with make_httpx_client(proxy_url) as client:
+        response = client.post(
+            build_openai_url(api_base_url, "/chat/completions"),
+            headers=headers,
+            json=body,
+        )
+        return extract_openai_image(parse_json_response(response), client, keep_alpha=keep_alpha)
 
 
 def model_supports_google_search(model_id: str) -> bool:
@@ -1509,6 +1636,27 @@ def resolve_aspect_ratio(model_id: str, aspect_ratio: str) -> tuple[str | None, 
     if aspect_ratio in fallback_map:
         return fallback_map[aspect_ratio], True
     return None, True
+
+
+def resolve_protocol_aspect_ratio(
+    api_protocol: str,
+    model_id: str,
+    aspect_ratio: str,
+) -> tuple[str | None, bool]:
+    """按协议解析比例，并标记是否需要最终本地精确裁切。"""
+    protocol = normalize_api_protocol(api_protocol)
+    if protocol == API_PROTOCOL_GEMINI:
+        return resolve_aspect_ratio(model_id, aspect_ratio)
+    if aspect_ratio == AUTO_ASPECT_RATIO:
+        return None, False
+    if protocol == API_PROTOCOL_OPENAI_CHAT:
+        return None, True
+    if model_id == GPT_IMAGE_2_VIP_MODEL_ID:
+        if aspect_ratio in get_model_meta(model_id)["native_aspects"]:
+            return aspect_ratio, False
+        return None, True
+    # 标准 OpenAI Images 常见原生尺寸只有方形、2:3 和 3:2；其它比例生成后精确裁切。
+    return aspect_ratio, aspect_ratio not in {"1:1", "2:3", "3:2"}
 
 
 def parse_ratio(value: str) -> tuple[int, int]:
@@ -1748,23 +1896,28 @@ def map_error_message(exc: Exception) -> str:
             str(exc),
         ]
     ).strip()
+    raw_text = re.sub(
+        r"(?i)(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{15,})",
+        "[已隐藏密钥]",
+        raw_text,
+    )
     normalized = raw_text.lower()
 
     if not raw_text:
         return "请求失败，但没有拿到明确的错误信息。"
     if "winerror 10060" in normalized or "connecttimeout" in normalized:
         return (
-            "连接 Google API 超时，当前更像是网络不通而不是 API Key 错误。"
+            "连接 API 超时，当前更像是网络不通而不是 API Key 错误。"
             "如果你在国内网络环境，请配置可用代理，或在上方“设置”里填写 HTTP/SOCKS5 代理地址后重试。"
         )
     if "timed out" in normalized or "timeout" in normalized:
-        return "请求超时（5 分钟内未完成）。请稍后重试，或降低分辨率 / 参考图数量。"
+        return "请求超时（5 分钟内未完成）。本次不会自动重试；请先核对服务商记录，避免重复扣费。"
     if "api key not valid" in normalized or "unauthenticated" in normalized or "invalid api key" in normalized:
-        return "API Key 无效，请检查是否复制完整，或确认该 Key 属于可用的 Google AI Studio 项目。"
+        return "API Key 无效，请检查是否复制完整，并确认 Key、Base URL 与所选协议属于同一个服务。"
     if "permission" in normalized or "forbidden" in normalized or "403" in normalized:
-        return "当前 API Key 没有访问该模型的权限。请确认项目已开通计费，或改用可访问的模型。"
+        return "当前 API Key 没有访问该模型的权限。请检查服务商授权、余额或改用可访问的模型。"
     if "quota" in normalized or "resource_exhausted" in normalized or "429" in normalized:
-        return "配额已耗尽或触发限流。请稍后再试，或检查 Google AI Studio / Cloud Billing 的配额与计费状态。"
+        return "配额已耗尽或触发限流。请检查当前服务商的余额、配额和频率限制。"
     if "safety" in normalized or "unsafe_prompt_for_image_generation" in normalized:
         return "内容被安全策略拦截，请调整 prompt 或参考图后重试。"
     if "blocked" in normalized or "rejected" in normalized or "filtered" in normalized:
@@ -1772,9 +1925,9 @@ def map_error_message(exc: Exception) -> str:
     if "output_mime_type parameter is not supported" in normalized:
         return "当前 Gemini 图像接口不支持 output_mime_type 参数，请升级到这份修复后的代码。"
     if "invalid_request_error" in normalized and "size" in normalized:
-        return "GPT-Image-2-VIP 的 size 参数无效，请使用下拉框里的比例和分辨率组合，或改回支持的尺寸档位。"
+        return "所选模型不接受当前 size 参数。请改用自适应比例或服务商支持的尺寸档位。"
     if "not found" in normalized or "404" in normalized:
-        return "请求的模型不存在或当前 API 版本不可用。请更新到最新 `google-genai` 后重试。"
+        return "接口或模型不存在。请检查协议、Base URL（是否重复填写 `/v1`）和模型名称。"
     if "exceeded" in normalized and "20mb" in normalized:
         return "上传内容超过接口允许大小，请压缩参考图后再试。"
     return f"请求失败：{raw_text}"
@@ -2743,6 +2896,7 @@ def save_settings_handler(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
+    api_protocol: str,
     output_root: str,
     backup_root: str,
     remember_api_key: bool,
@@ -2753,6 +2907,7 @@ def save_settings_handler(
         api_key,
         proxy_url,
         api_base_url,
+        api_protocol,
         str(output_path),
         str(backup_path),
         remember_api_key,
@@ -2788,6 +2943,7 @@ def save_settings_for_all_pages_handler(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
+    api_protocol: str,
     output_root: str,
     backup_root: str,
     remember_api_key: bool,
@@ -2798,6 +2954,7 @@ def save_settings_for_all_pages_handler(
         api_key,
         proxy_url,
         api_base_url,
+        api_protocol,
         output_root,
         backup_root,
         remember_api_key,
@@ -2805,60 +2962,88 @@ def save_settings_for_all_pages_handler(
     return get_creative_generate_button_update(api_key, prompt), get_generate_button_update(api_key), api_hint_text
 
 
-def test_connection_handler(api_key: str, proxy_url: str, api_base_url: str) -> str:
-    """测试连接按钮事件。"""
+def test_connection_handler(
+    api_key: str,
+    proxy_url: str,
+    api_base_url: str,
+    api_protocol: str,
+) -> str:
+    """按当前协议测试鉴权和模型列表端点，不发送可能计费的生图请求。"""
     if not normalize_api_key(api_key):
         raise gr.Error("请先填写 API Key。")
     try:
-        client = make_client(api_key, proxy_url, api_base_url)
-        response = client.models.generate_content(
-            model=TEST_MODEL_ID,
-            contents="ping",
-            config=types.GenerateContentConfig(
-                max_output_tokens=1,
-                temperature=0,
-                http_options=make_request_http_options(api_base_url),
-            ),
-        )
-        _ = getattr(response, "text", None)
+        protocol = normalize_api_protocol(api_protocol)
+        model_ids = list_available_models(api_key, proxy_url, api_base_url, protocol)
         endpoint_note = (
             f"自定义 Base URL：`{normalize_api_base_url(api_base_url)}`"
             if normalize_api_base_url(api_base_url)
-            else "Google 官方端点"
+            else ("Google 官方端点" if protocol == API_PROTOCOL_GEMINI else "OpenAI 官方端点")
         )
-        gr.Info(f"连接测试成功：已通过 `{TEST_MODEL_ID}` 完成最小请求，当前使用 {endpoint_note}。")
-        return "连接测试成功。"
+        message = (
+            f"连接测试成功：{protocol_display_name(protocol)} 的模型列表端点可用，"
+            f"检测到 {len(model_ids)} 个模型；当前使用 {endpoint_note}。"
+        )
+        gr.Info(message)
+        return message
     except Exception as exc:
         raise gr.Error(f"连接测试失败：{map_error_message(exc)}") from exc
 
 
-def save_available_models(model_ids: list[str]) -> None:
+def save_available_models(model_ids: list[str], api_protocol: str) -> None:
     """把检测到的可用模型列表并入本地配置，供下次启动直接用。"""
     data = load_config()
     if not isinstance(data, dict):
         data = {}
-    data["available_models"] = [m for m in model_ids if isinstance(m, str) and m]
+    protocol = normalize_api_protocol(api_protocol)
+    stored = data.get("available_models_by_protocol")
+    if not isinstance(stored, dict):
+        stored = {}
+    stored[protocol] = [m for m in model_ids if isinstance(m, str) and m]
+    data["available_models_by_protocol"] = stored
     write_json_file(CONFIG_PATH, data)
 
 
-def load_available_models() -> list[str]:
+def load_available_models(api_protocol: str) -> list[str]:
     """读取上次检测到的可用模型列表。"""
     data = load_config()
-    models = data.get("available_models") if isinstance(data, dict) else None
+    protocol = normalize_api_protocol(api_protocol)
+    by_protocol = data.get("available_models_by_protocol") if isinstance(data, dict) else None
+    models = by_protocol.get(protocol) if isinstance(by_protocol, dict) else None
+    if models is None and protocol == API_PROTOCOL_GEMINI and isinstance(data, dict):
+        models = data.get("available_models")
     if isinstance(models, list):
         return [m for m in models if isinstance(m, str) and m]
     return []
 
 
-def list_available_models(api_key: str, proxy_url: str, api_base_url: str) -> list[str]:
+def list_available_models(
+    api_key: str,
+    proxy_url: str,
+    api_base_url: str,
+    api_protocol: str,
+) -> list[str]:
     """向当前端点查询账号 / 中转站可用的全部模型 ID。"""
-    client = make_client(api_key, proxy_url, api_base_url)
+    protocol = normalize_api_protocol(api_protocol)
     seen: set[str] = set()
     ordered: list[str] = []
-    for model in client.models.list():
-        name = getattr(model, "name", "") or ""
-        model_id = name.split("/", 1)[1] if name.startswith("models/") else name
-        model_id = (model_id or "").strip()
+    if protocol == API_PROTOCOL_GEMINI:
+        client = make_client(api_key, proxy_url, api_base_url)
+        raw_ids = []
+        for model in client.models.list():
+            name = getattr(model, "name", "") or ""
+            raw_ids.append(name.split("/", 1)[1] if name.startswith("models/") else name)
+    else:
+        headers = {"Authorization": f"Bearer {normalize_api_key(api_key)}"}
+        with make_httpx_client(proxy_url) as http_client:
+            response = http_client.get(build_openai_url(api_base_url, "/models"), headers=headers)
+            payload = parse_json_response(response)
+        data = payload.get("data")
+        if not isinstance(data, list):
+            raise RuntimeError("OpenAI 兼容的 /v1/models 返回中缺少 data 数组。")
+        raw_ids = [item.get("id", "") for item in data if isinstance(item, dict)]
+
+    for raw_id in raw_ids:
+        model_id = str(raw_id or "").strip()
         if model_id and model_id not in seen:
             seen.add(model_id)
             ordered.append(model_id)
@@ -2877,18 +3062,61 @@ def build_model_choices(model_ids: list[str]) -> list[tuple[str, str]]:
     return choices
 
 
-def get_initial_model_choices() -> list[tuple[str, str]]:
+def get_initial_model_choices(api_protocol: str = API_PROTOCOL_GEMINI) -> list[tuple[str, str]]:
     """启动时的模型下拉选项：优先用上次检测结果，否则用内置列表。"""
-    detected = load_available_models()
+    protocol = normalize_api_protocol(api_protocol)
+    detected = load_available_models(protocol)
     if detected:
         return build_model_choices(detected)
-    return [(item["label"], item["value"]) for item in MODEL_OPTIONS]
+    if protocol == API_PROTOCOL_OPENAI_IMAGES:
+        built_in = [item for item in MODEL_OPTIONS if item.get("api_kind") == API_PROTOCOL_OPENAI_IMAGES]
+    else:
+        built_in = [item for item in MODEL_OPTIONS if item.get("api_kind") != API_PROTOCOL_OPENAI_IMAGES]
+    return [(item["label"], item["value"]) for item in built_in]
+
+
+def refresh_protocol_ui(
+    api_protocol: str,
+    current_model: str | None,
+) -> tuple[Any, ...]:
+    """切换协议时加载对应模型缓存，并关闭该协议不支持的 Gemini 专属参数。"""
+    protocol = normalize_api_protocol(api_protocol)
+    choices = get_initial_model_choices(protocol)
+    values = [value for _, value in choices]
+    selected = current_model if current_model in values else values[0]
+    is_gemini = protocol == API_PROTOCOL_GEMINI
+    endpoint = "Google 官方端点" if is_gemini else "OpenAI 官方端点"
+    hint = (
+        f"已切换到 **{protocol_display_name(protocol)}**。Base URL 留空时使用{endpoint}；"
+        "使用中转站时请填写其地址，然后点“检测可用模型”。"
+    )
+    row_updates = [gr.update(choices=choices) for _ in range(MAX_BATCH_ROWS)]
+    google_update = gr.update(interactive=True) if is_gemini else gr.update(value=False, interactive=False)
+    keep_seed_update = gr.update(interactive=True) if is_gemini else gr.update(value=False, interactive=False)
+    return (
+        hint,
+        gr.update(choices=choices, value=selected),
+        gr.update(choices=choices, value=selected),
+        gr.update(choices=choices, value=selected),
+        gr.update(choices=choices, value=selected),
+        *row_updates,
+        google_update,
+        gr.update(value=False, interactive=False),
+        keep_seed_update,
+        gr.update(value=None, interactive=False),
+        (
+            build_grounding_hint(selected, False)
+            if is_gemini
+            else "OpenAI 兼容协议不使用 Gemini 的种子、Google Search 或 Image Search 参数。"
+        ),
+    )
 
 
 def detect_models_handler(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
+    api_protocol: str,
     show_all: bool,
     current_model: str | None,
 ) -> tuple[Any, ...]:
@@ -2896,7 +3124,8 @@ def detect_models_handler(
     if not normalize_api_key(api_key):
         raise gr.Error("请先填写 API Key。")
     try:
-        all_ids = list_available_models(api_key, proxy_url, api_base_url)
+        protocol = normalize_api_protocol(api_protocol)
+        all_ids = list_available_models(api_key, proxy_url, api_base_url, protocol)
     except Exception as exc:
         raise gr.Error(f"检测失败：{map_error_message(exc)}") from exc
 
@@ -2912,7 +3141,7 @@ def detect_models_handler(
     else:
         note = ""
 
-    save_available_models(chosen)
+    save_available_models(chosen, protocol)
     choices = build_model_choices(chosen)
     values = [value for _, value in choices]
     creative_value = current_model if current_model in values else values[0]
@@ -2920,10 +3149,10 @@ def detect_models_handler(
     endpoint_note = (
         f"中转站 `{normalize_api_base_url(api_base_url)}`"
         if normalize_api_base_url(api_base_url)
-        else "Google 官方端点"
+        else ("Google 官方端点" if protocol == API_PROTOCOL_GEMINI else "OpenAI 官方端点")
     )
     status = (
-        f"✅ 已从 {endpoint_note} 检测到 {len(all_ids)} 个模型"
+        f"✅ 已通过 {protocol_display_name(protocol)} 从 {endpoint_note} 检测到 {len(all_ids)} 个模型"
         f"（疑似图像模型 {len(image_ids)} 个）。"
         f"下拉框已更新为 {len(chosen)} 个可选项。{note}"
     )
@@ -2934,6 +3163,8 @@ def detect_models_handler(
         status,
         gr.update(choices=choices, value=creative_value),
         gr.update(choices=choices),
+        gr.update(choices=choices, value=creative_value),
+        gr.update(choices=choices, value=creative_value),
         *row_updates,
     )
 
@@ -3034,6 +3265,7 @@ def generate_handler(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
+    api_protocol: str,
     output_root: str,
     backup_root: str,
     conversation_id: str | None,
@@ -3083,18 +3315,33 @@ def generate_handler(
         conversations = [conversation, *conversations]
 
     try:
+        protocol = normalize_api_protocol(api_protocol)
         output_root_path, backup_root_path = ensure_storage_roots(output_root, backup_root)
         update_conversation_title_if_needed(conversation, clean_prompt)
         base_seed, seed_locked = ensure_seed(keep_seed, seed_value)
         reference_paths = list(reference_image_paths or [])
-        reference_parts = prepare_reference_parts(reference_paths)
-        api_aspect_ratio, needs_ratio_postprocess = resolve_aspect_ratio(model_id, aspect_ratio)
-        api_image_size, needs_resize_postprocess = get_api_image_size(model_id, resolution)
-        tools, actual_image_search_enabled, grounding_notes = build_grounding_tool(
-            model_id=model_id,
-            enable_google_search=enable_google_search,
-            enable_image_search=enable_image_search,
+        reference_parts = (
+            prepare_reference_parts(reference_paths)
+            if protocol == API_PROTOCOL_GEMINI
+            else []
         )
+        api_aspect_ratio, needs_ratio_postprocess = resolve_protocol_aspect_ratio(
+            protocol, model_id, aspect_ratio
+        )
+        api_image_size, needs_resize_postprocess = get_api_image_size(model_id, resolution)
+        if protocol == API_PROTOCOL_GEMINI:
+            tools, actual_image_search_enabled, grounding_notes = build_grounding_tool(
+                model_id=model_id,
+                enable_google_search=enable_google_search,
+                enable_image_search=enable_image_search,
+            )
+        else:
+            tools, actual_image_search_enabled = None, False
+            grounding_notes = (
+                ["当前协议不支持 Gemini 的 Google Search grounding，本次已关闭检索增强。"]
+                if enable_google_search or enable_image_search
+                else []
+            )
         actual_google_search_enabled = bool(tools)
         grounding_summary = summarize_grounding_mode(
             actual_google_search_enabled, actual_image_search_enabled
@@ -3104,9 +3351,11 @@ def generate_handler(
             needs_ratio_postprocess=needs_ratio_postprocess,
             aspect_ratio=aspect_ratio,
         )
-        client = None
-        if not is_apiyi_openai_image_model(model_id):
-            client = make_client(api_key, proxy_url, api_base_url)
+        client = (
+            make_client(api_key, proxy_url, api_base_url)
+            if protocol == API_PROTOCOL_GEMINI
+            else None
+        )
     except Exception as exc:
         message = map_error_message(exc)
         gr.Warning(message)
@@ -3159,8 +3408,8 @@ def generate_handler(
         _recv_thread = threading.Thread(target=_recv_updater, daemon=True)
         _recv_thread.start()
         try:
-            if is_apiyi_openai_image_model(model_id):
-                image = generate_apiyi_openai_image(
+            if protocol == API_PROTOCOL_OPENAI_IMAGES:
+                image = generate_openai_image(
                     api_key=api_key,
                     proxy_url=proxy_url,
                     api_base_url=api_base_url,
@@ -3169,6 +3418,15 @@ def generate_handler(
                     reference_paths=reference_paths,
                     resolution=resolution,
                     api_aspect_ratio=api_aspect_ratio,
+                )
+            elif protocol == API_PROTOCOL_OPENAI_CHAT:
+                image = generate_openai_chat_image(
+                    api_key=api_key,
+                    proxy_url=proxy_url,
+                    api_base_url=api_base_url,
+                    model_id=model_id,
+                    prompt=effective_prompt,
+                    reference_paths=reference_paths,
                 )
             else:
                 parts = [types.Part.from_text(text=effective_prompt), *reference_parts]
@@ -3322,6 +3580,7 @@ def generate_or_unlock_batch_handler(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
+    api_protocol: str,
     output_root: str,
     backup_root: str,
     conversation_id: str | None,
@@ -3365,6 +3624,7 @@ def generate_or_unlock_batch_handler(
         api_key,
         proxy_url,
         api_base_url,
+        api_protocol,
         output_root,
         backup_root,
         conversation_id,
@@ -3648,8 +3908,9 @@ def apply_batch_defaults_handler(
     return tuple(updates)
 
 
-def clear_batch_table_handler() -> tuple[Any, ...]:
+def clear_batch_table_handler(api_protocol: str) -> tuple[Any, ...]:
     """清空批量页的任务输入和结果状态。"""
+    default_model = get_initial_model_choices(api_protocol)[0][1]
     row_updates: list[Any] = []
     for _ in range(MAX_BATCH_ROWS):
         row_updates.extend(
@@ -3659,7 +3920,7 @@ def clear_batch_table_handler() -> tuple[Any, ...]:
                 [],
                 build_batch_reference_hint([]),
                 gr.update(value=""),
-                gr.update(value=DEFAULT_PARAMS["model_id"]),
+                gr.update(value=default_model),
                 gr.update(value=False),
                 gr.update(value=False, interactive=False),
                 gr.update(value=DEFAULT_PARAMS["aspect_ratio"]),
@@ -3768,6 +4029,7 @@ def batch_generate_handler(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
+    api_protocol: str,
     output_root: str,
     backup_root: str,
     global_prompt_suffix: str,
@@ -3779,6 +4041,7 @@ def batch_generate_handler(
         raise gr.Error("请先在上方设置 API Key。")
 
     try:
+        protocol = normalize_api_protocol(api_protocol)
         tasks = collect_batch_tasks(row_values, global_prompt_suffix)
         total_requested = sum(int(task["images_per_prompt"]) for task in tasks)
         output_root_path, backup_root_path = ensure_storage_roots(output_root, backup_root)
@@ -3788,7 +4051,11 @@ def batch_generate_handler(
         backup_batch_root = output_day_dir(backup_root_path) / "batches" / batch_slug
         batch_root.mkdir(parents=True, exist_ok=True)
         backup_batch_root.mkdir(parents=True, exist_ok=True)
-        client = make_client(api_key, proxy_url, api_base_url)
+        client = (
+            make_client(api_key, proxy_url, api_base_url)
+            if protocol == API_PROTOCOL_GEMINI
+            else None
+        )
     except ValueError as exc:
         raise gr.Error(str(exc)) from exc
     except Exception as exc:
@@ -3837,18 +4104,26 @@ def batch_generate_handler(
         grounding_summary = "关闭"
         try:
             base_seed, _seed_locked = ensure_seed(task["keep_seed"], task["seed_value"])
-            reference_parts = prepare_reference_parts(task["reference_paths"])
-            api_aspect_ratio, needs_ratio_postprocess = resolve_aspect_ratio(
-                task["model_id"], task["aspect_ratio"]
+            reference_parts = (
+                prepare_reference_parts(task["reference_paths"])
+                if protocol == API_PROTOCOL_GEMINI
+                else []
+            )
+            api_aspect_ratio, needs_ratio_postprocess = resolve_protocol_aspect_ratio(
+                protocol, task["model_id"], task["aspect_ratio"]
             )
             api_image_size, needs_resize_postprocess = get_api_image_size(
                 task["model_id"], task["resolution"]
             )
-            tools, actual_image_search_enabled, grounding_notes = build_grounding_tool(
-                model_id=task["model_id"],
-                enable_google_search=task["enable_google_search"],
-                enable_image_search=task["enable_image_search"],
-            )
+            if protocol == API_PROTOCOL_GEMINI:
+                tools, actual_image_search_enabled, grounding_notes = build_grounding_tool(
+                    model_id=task["model_id"],
+                    enable_google_search=task["enable_google_search"],
+                    enable_image_search=task["enable_image_search"],
+                )
+            else:
+                tools, actual_image_search_enabled = None, False
+                grounding_notes = []
             actual_google_search_enabled = bool(tools)
             grounding_summary = summarize_grounding_mode(
                 actual_google_search_enabled, actual_image_search_enabled
@@ -3882,8 +4157,8 @@ def batch_generate_handler(
             )
             request_start = perf_counter()
             try:
-                if is_apiyi_openai_image_model(task["model_id"]):
-                    image = generate_apiyi_openai_image(
+                if protocol == API_PROTOCOL_OPENAI_IMAGES:
+                    image = generate_openai_image(
                         api_key=api_key,
                         proxy_url=proxy_url,
                         api_base_url=api_base_url,
@@ -3892,6 +4167,15 @@ def batch_generate_handler(
                         reference_paths=task["reference_paths"],
                         resolution=task["resolution"],
                         api_aspect_ratio=api_aspect_ratio,
+                    )
+                elif protocol == API_PROTOCOL_OPENAI_CHAT:
+                    image = generate_openai_chat_image(
+                        api_key=api_key,
+                        proxy_url=proxy_url,
+                        api_base_url=api_base_url,
+                        model_id=task["model_id"],
+                        prompt=effective_prompt,
+                        reference_paths=task["reference_paths"],
                     )
                 else:
                     config_kwargs: dict[str, Any] = {
@@ -3910,6 +4194,8 @@ def batch_generate_handler(
                     else:
                         config_kwargs["image_config"] = types.ImageConfig(image_size=api_image_size)
 
+                    if client is None:
+                        raise RuntimeError("Gemini 客户端未初始化。")
                     response = client.models.generate_content(
                         model=task["model_id"],
                         contents=types.Content(
@@ -4047,13 +4333,6 @@ def batch_generate_handler(
 
 # ── 图片编辑：局部重绘 / 放大 / 去背 / 水印 ────────────────────────────────
 
-# 图片编辑仅使用 Gemini 原生图像模型（走 generate_content，支持参考图编辑）。
-EDIT_MODEL_OPTIONS = [
-    item for item in MODEL_OPTIONS if item.get("api_kind") != "apiyi_openai_image"
-]
-EDIT_MODEL_CHOICES = [(item["label"], item["value"]) for item in EDIT_MODEL_OPTIONS]
-DEFAULT_EDIT_MODEL_ID = EDIT_MODEL_OPTIONS[0]["value"]
-
 MAX_UPSCALE_LONGEST_SIDE = 8192
 
 WATERMARK_POSITIONS = [
@@ -4123,6 +4402,51 @@ def run_gemini_image_edit(
     if keep_alpha:
         return extract_first_image_raw(response)
     return extract_first_image(response)
+
+
+def run_protocol_image_edit(
+    api_key: str,
+    proxy_url: str,
+    api_base_url: str,
+    api_protocol: str,
+    model_id: str,
+    prompt: str,
+    image_paths: list[str],
+    keep_alpha: bool = False,
+) -> Image.Image:
+    """按当前协议执行图片编辑；OpenAI Images 使用 edits，Chat 使用多模态消息。"""
+    protocol = normalize_api_protocol(api_protocol)
+    if protocol == API_PROTOCOL_OPENAI_IMAGES:
+        return generate_openai_image(
+            api_key=api_key,
+            proxy_url=proxy_url,
+            api_base_url=api_base_url,
+            model_id=model_id,
+            prompt=prompt,
+            reference_paths=image_paths,
+            resolution="1K",
+            api_aspect_ratio=None,
+            keep_alpha=keep_alpha,
+        )
+    if protocol == API_PROTOCOL_OPENAI_CHAT:
+        return generate_openai_chat_image(
+            api_key=api_key,
+            proxy_url=proxy_url,
+            api_base_url=api_base_url,
+            model_id=model_id,
+            prompt=prompt,
+            reference_paths=image_paths,
+            keep_alpha=keep_alpha,
+        )
+    return run_gemini_image_edit(
+        api_key=api_key,
+        proxy_url=proxy_url,
+        api_base_url=api_base_url,
+        model_id=model_id,
+        prompt=prompt,
+        image_paths=image_paths,
+        keep_alpha=keep_alpha,
+    )
 
 
 def save_single_edit_image(
@@ -4225,6 +4549,7 @@ def edit_inpaint_handler(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
+    api_protocol: str,
     output_root: str,
     backup_root: str,
     progress: gr.Progress = gr.Progress(track_tqdm=False),
@@ -4261,8 +4586,8 @@ def edit_inpaint_handler(
 
     try:
         progress(0.3, desc="重绘中...")
-        image = run_gemini_image_edit(
-            api_key, proxy_url, api_base_url, model_id, prompt, image_paths,
+        image = run_protocol_image_edit(
+            api_key, proxy_url, api_base_url, api_protocol, model_id, prompt, image_paths,
         )
         progress(0.9, desc="保存中...")
         primary_path, backup_path = save_single_edit_image(
@@ -4341,6 +4666,7 @@ def edit_background_handler(
     api_key: str,
     proxy_url: str,
     api_base_url: str,
+    api_protocol: str,
     output_root: str,
     backup_root: str,
     progress: gr.Progress = gr.Progress(track_tqdm=False),
@@ -4367,8 +4693,8 @@ def edit_background_handler(
 
     try:
         progress(0.3, desc="去背中...")
-        image = run_gemini_image_edit(
-            api_key, proxy_url, api_base_url, model_id, prompt, [image_path],
+        image = run_protocol_image_edit(
+            api_key, proxy_url, api_base_url, api_protocol, model_id, prompt, [image_path],
             keep_alpha=keep_alpha,
         )
         if background_mode == "透明":
@@ -4460,6 +4786,7 @@ def build_demo() -> gr.Blocks:
     initial_remember_api_key = get_initial_remember_api_key()
     initial_proxy = get_initial_proxy_url()
     initial_api_base_url = get_initial_api_base_url()
+    initial_api_protocol = get_initial_api_protocol()
     initial_output_root = get_initial_output_root()
     initial_backup_root = get_initial_backup_root()
     conversations, initial_conversation_id = ensure_initial_conversations()
@@ -4471,10 +4798,15 @@ def build_demo() -> gr.Blocks:
         initial_conversation, initial_output_root_path, initial_backup_root_path
     )
     initial_prompt_history_choices = build_prompt_history_choices(load_prompt_history())
-    initial_model_choices = get_initial_model_choices()
+    initial_model_choices = get_initial_model_choices(initial_api_protocol)
+    initial_edit_model_value = initial_model_choices[0][1]
+    initial_model_values = [value for _, value in initial_model_choices]
+    initial_creative_model_value = (
+        initial_view[8] if initial_view[8] in initial_model_values else initial_edit_model_value
+    )
     settings_open = not bool(initial_api_key)
 
-    with gr.Blocks(title="Gemini 本地图像生成工具", fill_width=True) as demo:
+    with gr.Blocks(title="AI 本地图像生成工具", fill_width=True) as demo:
         conversations_state = gr.State(conversations)
         current_conversation_id = gr.State(initial_conversation["id"])
         batch_visible_rows_state = gr.State(INITIAL_BATCH_ROWS)
@@ -4482,16 +4814,23 @@ def build_demo() -> gr.Blocks:
         with gr.Column(elem_classes=["app-shell"]):
             with gr.Accordion("设置", open=settings_open, elem_classes=["settings-wrap"]):
                 with gr.Row():
+                    api_protocol_dropdown = gr.Dropdown(
+                        label="接口协议",
+                        choices=API_PROTOCOL_CHOICES,
+                        value=initial_api_protocol,
+                        interactive=True,
+                        scale=3,
+                    )
                     api_key_box = gr.Textbox(
                         label="API Key",
-                        placeholder="请粘贴 Google 官方或 Gemini 中转站 API Key",
+                        placeholder="请粘贴官方平台或中转站 API Key",
                         type="password",
                         value=initial_api_key,
                         scale=4,
                     )
                     api_base_url_box = gr.Textbox(
-                        label="Gemini Base URL（可选）",
-                        placeholder=f"留空=Google 官方；APIYI 示例：{DEFAULT_RELAY_BASE_URL}",
+                        label="Base URL（可选）",
+                        placeholder="可填中转站根域名或带 /v1 的地址；留空走所选协议的官方端点",
                         value=initial_api_base_url,
                         scale=4,
                     )
@@ -4543,7 +4882,7 @@ def build_demo() -> gr.Blocks:
                     elem_classes=["muted-note"],
                 )
                 gr.Markdown(
-                    f"当前默认留空表示走 Google 官方 Gemini 端点；如果使用 APIYI 这类 Gemini 原生中转，请填写根域名，例如 `{DEFAULT_RELAY_BASE_URL}`。",
+                    f"协议必须与中转站文档一致。Base URL 可填根域名或 `/v1` 地址；例如旧版 APIYI 地址 `{LEGACY_APIYI_BASE_URL}` 仍可继续使用。生成失败不会自动重试，避免重复扣费。",
                     elem_classes=["muted-note"],
                 )
 
@@ -4656,7 +4995,7 @@ def build_demo() -> gr.Blocks:
                             model_dropdown = gr.Dropdown(
                                 label="模型",
                                 choices=initial_model_choices,
-                                value=initial_view[8],
+                                value=initial_creative_model_value,
                                 allow_custom_value=True,
                             )
                             aspect_ratio_dropdown = gr.Dropdown(
@@ -4755,8 +5094,8 @@ def build_demo() -> gr.Blocks:
                                 )
                                 edit_inpaint_model = gr.Dropdown(
                                     label="模型",
-                                    choices=EDIT_MODEL_CHOICES,
-                                    value=DEFAULT_EDIT_MODEL_ID,
+                                    choices=initial_model_choices,
+                                    value=initial_edit_model_value,
                                 )
                                 edit_inpaint_button = gr.Button(
                                     "开始重绘", variant="primary",
@@ -4832,15 +5171,15 @@ def build_demo() -> gr.Blocks:
                                 )
                                 edit_bg_model = gr.Dropdown(
                                     label="模型",
-                                    choices=EDIT_MODEL_CHOICES,
-                                    value=DEFAULT_EDIT_MODEL_ID,
+                                    choices=initial_model_choices,
+                                    value=initial_edit_model_value,
                                 )
                                 edit_bg_button = gr.Button(
                                     "开始去背", variant="primary",
                                     elem_classes=["generate-button"],
                                 )
                                 gr.Markdown(
-                                    "由 Gemini 抠图。透明背景依赖模型输出，边缘要求高时可选“绿幕”后自行精修。",
+                                    "由当前协议和模型完成抠图。透明背景依赖模型输出，边缘要求高时可选“绿幕”后自行精修。",
                                     elem_classes=["muted-note"],
                                 )
                             with gr.Column(scale=2, min_width=320):
@@ -4957,7 +5296,7 @@ def build_demo() -> gr.Blocks:
                             batch_default_model_dropdown = gr.Dropdown(
                                 label="默认模型",
                                 choices=initial_model_choices,
-                                value=DEFAULT_PARAMS["model_id"],
+                                value=initial_edit_model_value,
                                 allow_custom_value=True,
                             )
                             with gr.Row():
@@ -5053,7 +5392,7 @@ def build_demo() -> gr.Blocks:
                                     row_model_dropdown = gr.Dropdown(
                                         label="模型",
                                         choices=initial_model_choices,
-                                        value=DEFAULT_PARAMS["model_id"],
+                                        value=initial_edit_model_value,
                                         allow_custom_value=True,
                                     )
                                     batch_row_model_dropdowns.append(row_model_dropdown)
@@ -5237,6 +5576,7 @@ def build_demo() -> gr.Blocks:
                 api_key_box,
                 proxy_box,
                 api_base_url_box,
+                api_protocol_dropdown,
                 output_root_box,
                 backup_root_box,
                 remember_api_key_checkbox,
@@ -5256,7 +5596,7 @@ def build_demo() -> gr.Blocks:
         )
         test_button.click(
             fn=test_connection_handler,
-            inputs=[api_key_box, proxy_box, api_base_url_box],
+            inputs=[api_key_box, proxy_box, api_base_url_box, api_protocol_dropdown],
             outputs=status_markdown,
         )
         detect_models_button.click(
@@ -5265,6 +5605,7 @@ def build_demo() -> gr.Blocks:
                 api_key_box,
                 proxy_box,
                 api_base_url_box,
+                api_protocol_dropdown,
                 show_all_models_checkbox,
                 model_dropdown,
             ],
@@ -5272,7 +5613,26 @@ def build_demo() -> gr.Blocks:
                 detect_models_hint,
                 model_dropdown,
                 batch_default_model_dropdown,
+                edit_inpaint_model,
+                edit_bg_model,
                 *batch_row_model_dropdowns,
+            ],
+        )
+        api_protocol_dropdown.change(
+            fn=refresh_protocol_ui,
+            inputs=[api_protocol_dropdown, model_dropdown],
+            outputs=[
+                detect_models_hint,
+                model_dropdown,
+                batch_default_model_dropdown,
+                edit_inpaint_model,
+                edit_bg_model,
+                *batch_row_model_dropdowns,
+                google_search_checkbox,
+                image_search_checkbox,
+                keep_seed_checkbox,
+                seed_number,
+                grounding_hint,
             ],
         )
         keep_seed_checkbox.change(
@@ -5339,6 +5699,7 @@ def build_demo() -> gr.Blocks:
         )
         clear_batch_button.click(
             fn=clear_batch_table_handler,
+            inputs=api_protocol_dropdown,
             outputs=[
                 batch_prompt_suffix_box,
                 *batch_row_clear_outputs,
@@ -5480,6 +5841,7 @@ def build_demo() -> gr.Blocks:
                 api_key_box,
                 proxy_box,
                 api_base_url_box,
+                api_protocol_dropdown,
                 output_root_box,
                 backup_root_box,
                 current_conversation_id,
@@ -5518,6 +5880,7 @@ def build_demo() -> gr.Blocks:
                 api_key_box,
                 proxy_box,
                 api_base_url_box,
+                api_protocol_dropdown,
                 output_root_box,
                 backup_root_box,
                 batch_prompt_suffix_box,
@@ -5544,6 +5907,7 @@ def build_demo() -> gr.Blocks:
                 api_key_box,
                 proxy_box,
                 api_base_url_box,
+                api_protocol_dropdown,
                 output_root_box,
                 backup_root_box,
             ],
@@ -5569,6 +5933,7 @@ def build_demo() -> gr.Blocks:
                 api_key_box,
                 proxy_box,
                 api_base_url_box,
+                api_protocol_dropdown,
                 output_root_box,
                 backup_root_box,
             ],

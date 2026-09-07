@@ -19,7 +19,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 
-/** Direct HTTPS client compatible with the desktop app's two API protocols. */
+/** Direct HTTPS client compatible with the desktop app's protocol adapters. */
 public final class ApiClient {
     public static final int MAX_REFERENCE_TOTAL = 12 * 1024 * 1024;
     private static final int MAX_RESPONSE = 48 * 1024 * 1024;
@@ -27,8 +27,8 @@ public final class ApiClient {
     private volatile boolean cancelled;
 
     public static final class Options {
-        public String key = "", base = "", model = Protocol.BANANA, prompt = "", ratio = "1:1", resolution = "1K";
-        public boolean openAi, webSearch, imageSearch;
+        public String key = "", base = "", protocol = Protocol.GEMINI, model = Protocol.BANANA, prompt = "", ratio = "1:1", resolution = "1K";
+        public boolean webSearch, imageSearch;
         public Long seed;
         public int count = 1;
         public final List<File> references = new ArrayList<>();
@@ -41,7 +41,8 @@ public final class ApiClient {
     public static void validate(Options o) {
         if (o.key.trim().isEmpty()) throw new IllegalArgumentException("请先在设置中填写 API Key");
         if (o.key.contains("\n") || o.key.contains("\r")) throw new IllegalArgumentException("API Key 中含有换行，请重新粘贴");
-        Protocol.baseUrl(o.base, o.openAi); Protocol.modelId(o.model);
+        o.protocol = Protocol.normalizeProtocol(o.protocol);
+        Protocol.baseUrl(o.base, o.protocol); Protocol.modelId(o.model);
         if (o.prompt.trim().isEmpty()) throw new IllegalArgumentException("请先填写提示词");
         if (o.prompt.length() > 30000) throw new IllegalArgumentException("提示词请控制在 30,000 字符以内");
         if (o.count < 1 || o.count > 10) throw new IllegalArgumentException("每批可生成 1–10 张");
@@ -49,7 +50,8 @@ public final class ApiClient {
         long total = 0;
         for (File f : o.references) { if (!f.isFile() || f.length() == 0) throw new IllegalArgumentException("参考图已失效，请重新选择"); total += f.length(); }
         if (total > MAX_REFERENCE_TOTAL) throw new IllegalArgumentException("参考图总大小超过 12MB，请减少或压缩图片");
-        if (o.openAi) Protocol.openAiSize(o.model, o.ratio, o.resolution); else Protocol.apiRatio(o.model, o.ratio);
+        if (Protocol.OPENAI_IMAGES.equals(o.protocol)) Protocol.openAiSize(o.model, o.ratio, o.resolution);
+        else if (Protocol.isGemini(o.protocol)) Protocol.apiRatio(o.model, o.ratio);
     }
 
     private HttpURLConnection connect(String target, Options o, boolean authenticated) throws Exception {
@@ -57,7 +59,9 @@ public final class ApiClient {
         if (!"https".equals(url.getProtocol()) || url.getUserInfo() != null) throw new IOException("仅允许安全的 HTTPS 接口和图片地址");
         HttpURLConnection c = (HttpURLConnection) url.openConnection(); connection = c;
         c.setConnectTimeout(30000); c.setReadTimeout(300000); c.setInstanceFollowRedirects(false);
-        if (authenticated) c.setRequestProperty(o.openAi ? "Authorization" : "x-goog-api-key", o.openAi ? "Bearer " + o.key.trim() : o.key.trim());
+        if (authenticated) c.setRequestProperty(
+            Protocol.isGemini(o.protocol) ? "x-goog-api-key" : "Authorization",
+            Protocol.isGemini(o.protocol) ? o.key.trim() : "Bearer " + o.key.trim());
         return c;
     }
 
@@ -96,26 +100,27 @@ public final class ApiClient {
     }
 
     public List<String> detectModels(Options o) throws Exception {
-        String base = Protocol.baseUrl(o.base, o.openAi), token = ""; List<String> result = new ArrayList<>();
+        boolean gemini = Protocol.isGemini(o.protocol);
+        String base = Protocol.baseUrl(o.base, o.protocol), token = ""; List<String> result = new ArrayList<>();
         for (int page = 0; page < 10; page++) {
-            String suffix = o.openAi ? "" : "?pageSize=100" + (token.isEmpty() ? "" : "&pageToken=" + URLEncoder.encode(token, "UTF-8"));
+            String suffix = gemini ? "?pageSize=100" + (token.isEmpty() ? "" : "&pageToken=" + URLEncoder.encode(token, "UTF-8")) : "";
             JSONObject data = json(base + "/models" + suffix, o, null);
-            JSONArray models = data.optJSONArray(o.openAi ? "data" : "models");
+            JSONArray models = data.optJSONArray(gemini ? "models" : "data");
             if (models == null) throw new IOException("模型列表格式与所选协议不匹配，也可手动输入模型名称");
             for (int i = 0; i < models.length(); i++) {
                 JSONObject item = models.optJSONObject(i); if (item == null) continue;
-                String id = item.optString(o.openAi ? "id" : "name").replaceFirst("^models/", "");
+                String id = item.optString(gemini ? "name" : "id").replaceFirst("^models/", "");
                 try { Protocol.modelId(id); } catch (Exception ignored) { continue; }
                 if (Protocol.looksImage(id) && !result.contains(id)) result.add(id);
             }
-            token = data.optString("nextPageToken", ""); if (o.openAi || token.isEmpty()) break;
+            token = data.optString("nextPageToken", ""); if (!gemini || token.isEmpty()) break;
         }
         return result;
     }
 
     public Result generate(Options o, int index) throws Exception {
-        validate(o); check(); String base = Protocol.baseUrl(o.base, o.openAi); Result result = new Result();
-        if (!o.openAi) {
+        validate(o); check(); String base = Protocol.baseUrl(o.base, o.protocol); Result result = new Result();
+        if (Protocol.isGemini(o.protocol)) {
             JSONArray refs = new JSONArray();
             for (File f : o.references) {
                 check(); refs.put(new JSONObject().put("inlineData", new JSONObject().put("mimeType", mime(f))
@@ -126,20 +131,31 @@ public final class ApiClient {
             JSONObject payload = json(base + "/models/" + Protocol.modelId(o.model) + ":generateContent", o, body);
             result.bytes = Base64.getMimeDecoder().decode(Protocol.geminiImage(payload).getString("data"));
             result.sources = Protocol.sources(payload);
-        } else {
+        } else if (Protocol.OPENAI_IMAGES.equals(o.protocol)) {
             JSONObject body = Protocol.openAiBody(o.model, o.prompt, o.ratio, o.resolution);
             JSONObject payload = o.references.isEmpty() ? json(base + "/images/generations", o, body) : multipart(base + "/images/edits", o, body);
-            JSONArray images = payload.optJSONArray("data"); if (images == null || images.length() == 0) throw new IOException("接口没有返回图片");
-            JSONObject first = images.getJSONObject(0); String data = first.optString("b64_json", "");
-            if (!data.isEmpty()) {
-                if (data.startsWith("data:")) data = data.substring(data.indexOf(',') + 1);
-                result.bytes = Base64.getMimeDecoder().decode(data);
-            } else {
-                String url = first.optString("url", ""); if (url.isEmpty()) throw new IOException("返回结果中没有图片数据或下载地址");
-                result.bytes = download(url, o);
+            result.bytes = openAiImageBytes(payload, o);
+        } else {
+            JSONArray refs = new JSONArray();
+            for (File f : o.references) {
+                check(); refs.put("data:" + mime(f) + ";base64," + Base64.getEncoder().encodeToString(Files.readAllBytes(f.toPath())));
             }
+            JSONObject body = Protocol.openAiChatBody(o.model, o.prompt, o.ratio, o.resolution, refs);
+            result.bytes = openAiImageBytes(json(base + "/chat/completions", o, body), o);
         }
         check(); return result;
+    }
+
+    private byte[] openAiImageBytes(JSONObject payload, Options o) throws Exception {
+        String value = Protocol.openAiImage(payload).trim();
+        if (value.startsWith("https://") || value.startsWith("http://")) return download(value, o);
+        if (value.startsWith("data:")) {
+            int comma = value.indexOf(',');
+            if (comma < 0) throw new IOException("图片 data URL 格式不正确");
+            value = value.substring(comma + 1);
+        }
+        try { return Base64.getMimeDecoder().decode(value); }
+        catch (IllegalArgumentException e) { throw new IOException("接口返回的图片 base64 数据无法解析"); }
     }
 
     private JSONObject multipart(String url, Options o, JSONObject fields) throws Exception {

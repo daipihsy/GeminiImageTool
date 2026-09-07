@@ -7,13 +7,15 @@ import static org.junit.Assert.*;
 
 public class ProtocolTest {
     @Test public void normalizesProtocolRoots() {
-        assertEquals("https://generativelanguage.googleapis.com/v1beta", Protocol.baseUrl("", false));
-        assertEquals("https://api.apiyi.com/v1", Protocol.baseUrl("", true));
-        assertEquals("https://relay.example/proxy/v1beta", Protocol.baseUrl("https://relay.example/proxy/v1/", false));
+        assertEquals("https://generativelanguage.googleapis.com/v1beta", Protocol.baseUrl("", Protocol.GEMINI));
+        assertEquals("https://api.openai.com/v1", Protocol.baseUrl("", Protocol.OPENAI_IMAGES));
+        assertEquals("https://relay.example/proxy/v1beta", Protocol.baseUrl("https://relay.example/proxy/v1/", Protocol.GEMINI));
+        assertEquals("https://relay.example/proxy/v1", Protocol.baseUrl("https://relay.example/proxy/v1beta/", Protocol.OPENAI_CHAT));
+        assertEquals(Protocol.OPENAI_IMAGES, Protocol.normalizeProtocol("openai"));
     }
     @Test public void rejectsUnsafeOrCompleteEndpoints() {
         for (String url : new String[]{"http://relay.example", "https://u:p@relay.example", "https://relay.example?key=x", "https://relay.example/v1/images/generations"})
-            assertThrows(IllegalArgumentException.class, () -> Protocol.baseUrl(url, true));
+            assertThrows(IllegalArgumentException.class, () -> Protocol.baseUrl(url, Protocol.OPENAI_IMAGES));
     }
     @Test public void rejectsModelPathInjection() {
         assertEquals(Protocol.BANANA, Protocol.modelId("models/" + Protocol.BANANA));
@@ -44,8 +46,22 @@ public class ProtocolTest {
     }
     @Test public void matchesDesktopGptSizeTable() throws Exception {
         JSONObject body = Protocol.openAiBody(Protocol.GPT, "x", "9:16", "4K");
-        assertEquals("2160x3840", body.getString("size")); assertEquals(1, body.getInt("n")); assertFalse(body.has("seed"));
+        assertEquals("2160x3840", body.getString("size")); assertEquals(1, body.getInt("n"));
+        assertFalse(body.has("seed")); assertFalse(body.has("response_format"));
+        assertFalse(Protocol.openAiBody("gpt-image-1", "x", "自适应", "1K").has("size"));
         assertThrows(IllegalArgumentException.class, () -> Protocol.openAiSize(Protocol.GPT, "4:1", "2K"));
+    }
+    @Test public void buildsChatImageRequestWithOrderedReferences() throws Exception {
+        JSONObject body = Protocol.openAiChatBody("relay-image-model", "draw", "1:1", "2K", new JSONArray().put("data:image/png;base64,one").put("data:image/png;base64,two"));
+        JSONArray content = body.getJSONArray("messages").getJSONObject(0).getJSONArray("content");
+        assertTrue(content.getJSONObject(0).getString("text").startsWith("draw"));
+        assertEquals("data:image/png;base64,one", content.getJSONObject(1).getJSONObject("image_url").getString("url"));
+        assertEquals("image", body.getJSONArray("modalities").getString(1));
+    }
+    @Test public void parsesOpenAiAndChatImageShapes() throws Exception {
+        assertEquals("abc", Protocol.openAiImage(new JSONObject("{\"data\":[{\"b64_json\":\"abc\"}]}")));
+        assertEquals("data:image/png;base64,xyz", Protocol.openAiImage(new JSONObject("{\"choices\":[{\"message\":{\"images\":[{\"image_url\":{\"url\":\"data:image/png;base64,xyz\"}}]}}]}")));
+        assertEquals("https://cdn.example/a.png", Protocol.openAiImage(new JSONObject("{\"choices\":[{\"message\":{\"content\":\"![image](https://cdn.example/a.png)\"}}]}")));
     }
     @Test public void skipsThoughtImages() throws Exception {
         JSONObject payload = new JSONObject("{\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"inlineData\":{\"data\":\"draft\"}},{\"inlineData\":{\"data\":\"final\"}}]}}]}");

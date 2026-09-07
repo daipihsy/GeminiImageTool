@@ -35,12 +35,12 @@ jobs:
         working-directory: android
         run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
       - name: Give the APK a friendly filename
-        run: cp android/app/build/outputs/apk/debug/app-debug.apk GeminiImageTool-Android-1.0.0-beta1.apk
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk GeminiImageTool-Android-1.1.0-beta1.apk
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: GeminiImageTool-Android-beta
-          path: GeminiImageTool-Android-1.0.0-beta1.apk
+          path: GeminiImageTool-Android-1.1.0-beta1.apk
           retention-days: 30
       - name: Upload reports
         if: always()
@@ -59,4 +59,4 @@ jobs:
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --title "GeminiImageTool $RELEASE_TAG" --notes "Automated build."
           fi
-          gh release upload "$RELEASE_TAG" GeminiImageTool-Android-1.0.0-beta1.apk --clobber
+          gh release upload "$RELEASE_TAG" GeminiImageTool-Android-1.1.0-beta1.apk --clobber

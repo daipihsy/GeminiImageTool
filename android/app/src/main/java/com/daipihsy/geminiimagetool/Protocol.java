@@ -7,21 +7,38 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /** Shared request/response rules kept independent of Android for offline tests. */
 public final class Protocol {
+    public static final String GEMINI = "gemini";
+    public static final String OPENAI_IMAGES = "openai_images";
+    public static final String OPENAI_CHAT = "openai_chat";
     public static final String BANANA = "gemini-3.1-flash-image-preview";
     public static final String PRO = "gemini-3-pro-image-preview";
     public static final String GPT = "gpt-image-2-vip";
     public static final String[] RATIOS = {"自适应", "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9", "4:1", "1:4"};
     public static final String[] RESOLUTIONS = {"512", "1K", "2K", "4K"};
     private static final Pattern MODEL = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,199}");
+    private static final Pattern MARKDOWN_IMAGE = Pattern.compile(
+        "!\\[[^\\]]*\\]\\((data:image/[^)]+|https?://[^)]+)\\)", Pattern.CASE_INSENSITIVE);
     private Protocol() {}
 
-    public static String baseUrl(String value, boolean openAi) {
+    public static String normalizeProtocol(String value) {
+        String protocol = value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+        if ("openai".equals(protocol) || "openai_image".equals(protocol)) return OPENAI_IMAGES;
+        if ("chat".equals(protocol) || "openai-chat".equals(protocol)) return OPENAI_CHAT;
+        if (OPENAI_IMAGES.equals(protocol) || OPENAI_CHAT.equals(protocol)) return protocol;
+        return GEMINI;
+    }
+
+    public static boolean isGemini(String protocol) { return GEMINI.equals(normalizeProtocol(protocol)); }
+
+    public static String baseUrl(String value, String protocolValue) {
+        String protocol = normalizeProtocol(protocolValue);
         String raw = value == null ? "" : value.trim();
-        if (raw.isEmpty()) raw = openAi ? "https://api.apiyi.com" : "https://generativelanguage.googleapis.com";
+        if (raw.isEmpty()) raw = isGemini(protocol) ? "https://generativelanguage.googleapis.com" : "https://api.openai.com";
         while (raw.endsWith("/")) raw = raw.substring(0, raw.length() - 1);
         URI uri;
         try { uri = URI.create(raw); } catch (Exception e) { throw new IllegalArgumentException("Base URL 格式不正确"); }
@@ -30,10 +47,11 @@ public final class Protocol {
             throw new IllegalArgumentException("Base URL 请填写 HTTPS 根地址，不能包含密钥、问号或片段");
         }
         String path = uri.getPath() == null ? "" : uri.getPath();
-        if (path.contains("/models/") || path.endsWith("/images/generations") || path.endsWith("/images/edits"))
+        if (path.contains("/models/") || path.endsWith("/models") || path.endsWith("/images/generations") || path.endsWith("/images/edits")
+                || path.endsWith("/chat/completions"))
             throw new IllegalArgumentException("Base URL 只填写根地址，或以 /v1、/v1beta 结尾");
-        raw = raw.replaceFirst("/v1(?:beta)?$", "");
-        return raw + (openAi ? "/v1" : "/v1beta");
+        raw = raw.replaceFirst("(?i)/v1(?:beta)?$", "");
+        return raw + (isGemini(protocol) ? "/v1beta" : "/v1");
     }
 
     public static String modelId(String value) {
@@ -44,7 +62,7 @@ public final class Protocol {
 
     public static boolean looksImage(String value) {
         String s = value.toLowerCase(Locale.ROOT);
-        for (String key : new String[]{"image", "imagen", "banana", "dall", "flux", "seedream", "kontext", "sdxl", "stable-diffusion"})
+        for (String key : new String[]{"image", "imagen", "banana", "dall", "flux", "seedream", "kontext", "qwen-image", "hunyuan-image", "grok-2-image", "ideogram", "recraft", "sdxl", "stable-diffusion", "sd3"})
             if (s.contains(key)) return true;
         return false;
     }
@@ -113,8 +131,29 @@ public final class Protocol {
     }
 
     public static JSONObject openAiBody(String model, String prompt, String ratio, String resolution) throws Exception {
-        return new JSONObject().put("model", modelId(model)).put("prompt", prompt)
-            .put("size", openAiSize(model, ratio, resolution)).put("n", 1).put("response_format", "b64_json");
+        String effective = prompt;
+        if (!GPT.equals(model) && !"自适应".equals(ratio) && !Arrays.asList("1:1", "2:3", "3:2").contains(ratio))
+            effective += "\nCompose for a final " + ratio + " center crop. Keep the important subject away from the edges.";
+        JSONObject body = new JSONObject().put("model", modelId(model)).put("prompt", effective).put("n", 1);
+        String size = openAiSize(model, ratio, resolution);
+        if (!"auto".equals(size)) body.put("size", size);
+        return body;
+    }
+
+    public static JSONObject openAiChatBody(String model, String prompt, String ratio, String resolution, JSONArray referenceDataUrls) throws Exception {
+        String effective = prompt;
+        if (!"自适应".equals(ratio)) effective += "\nCreate the image for a final " + ratio + " center crop; keep important subjects away from the edges.";
+        if (resolution != null && !resolution.trim().isEmpty()) effective += "\nRequested image quality tier: " + resolution + ".";
+        JSONArray content = new JSONArray().put(new JSONObject().put("type", "text").put("text", effective));
+        for (int i = 0; i < referenceDataUrls.length(); i++) {
+            content.put(new JSONObject().put("type", "image_url")
+                .put("image_url", new JSONObject().put("url", referenceDataUrls.getString(i))));
+        }
+        return new JSONObject()
+            .put("model", modelId(model))
+            .put("messages", new JSONArray().put(new JSONObject().put("role", "user").put("content", content)))
+            .put("modalities", new JSONArray().put("text").put("image"))
+            .put("stream", false);
     }
 
     public static JSONObject geminiImage(JSONObject response) throws Exception {
@@ -149,6 +188,51 @@ public final class Protocol {
             if (web != null) lines.add(web.optString("title") + "\n" + web.optString("uri"));
         }
         return String.join("\n\n", lines);
+    }
+
+    public static String openAiImage(JSONObject response) {
+        String value = findImage(response);
+        if (value.isEmpty()) throw new IllegalStateException(
+            "接口请求成功，但返回结果中没有找到图片（支持 b64_json、data URL、url 和 message.images）");
+        return value;
+    }
+
+    private static String findImage(Object value) {
+        if (value instanceof String) {
+            String text = ((String) value).trim();
+            if (text.toLowerCase(Locale.ROOT).startsWith("data:image/")) return text;
+            Matcher match = MARKDOWN_IMAGE.matcher(text);
+            return match.find() ? match.group(1).trim() : "";
+        }
+        if (value instanceof JSONArray) {
+            JSONArray list = (JSONArray) value;
+            for (int i = 0; i < list.length(); i++) {
+                String found = findImage(list.opt(i));
+                if (!found.isEmpty()) return found;
+            }
+            return "";
+        }
+        if (!(value instanceof JSONObject)) return "";
+        JSONObject object = (JSONObject) value;
+        for (String key : new String[]{"b64_json", "image_base64", "base64"}) {
+            String found = object.optString(key, "").trim();
+            if (!found.isEmpty()) return found;
+        }
+        Object imageUrl = object.opt("image_url");
+        if (imageUrl instanceof String && !((String) imageUrl).trim().isEmpty()) return ((String) imageUrl).trim();
+        if (imageUrl instanceof JSONObject) {
+            String url = ((JSONObject) imageUrl).optString("url", "").trim();
+            if (!url.isEmpty()) return url;
+        }
+        String directUrl = object.optString("url", "").trim();
+        if (directUrl.startsWith("https://") || directUrl.startsWith("http://") || directUrl.startsWith("data:image/"))
+            return directUrl;
+        for (String key : new String[]{"data", "images", "output", "choices", "message", "content", "result"}) {
+            if (!object.has(key)) continue;
+            String found = findImage(object.opt(key));
+            if (!found.isEmpty()) return found;
+        }
+        return "";
     }
 
     public static String friendlyError(int status, String body, String key) {

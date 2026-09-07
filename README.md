@@ -1,4 +1,4 @@
-# Gemini 本地图像生成工具
+# AI 本地图像生成工具
 
 ## Android 手机版本
 
@@ -6,13 +6,25 @@
 
 安装和构建说明见 [android/README.md](android/README.md)。安卓代码位于 `android/`，原有 Windows / macOS 版不受影响。
 
-一个本地运行的 Gemini 图像生成工具，使用 `Gradio + google-genai` 实现，目标是替代 Google AI Studio 网页版的常用出图流程。
+一个本地运行的 AI 生图工具。桌面版使用 `Gradio + google-genai + httpx`，Android 版直接请求 HTTPS 接口；两端都不再绑定某一家中转站。
+
+## 接口协议兼容
+
+| 协议 | 请求端点 | 适合场景 | 返回图片兼容 |
+| --- | --- | --- | --- |
+| Gemini 原生 | `models/{model}:generateContent` | Gemini / Nano Banana 官方或原生中转 | `candidates[].content.parts[].inlineData` |
+| OpenAI Images | `images/generations`、`images/edits` | GPT Image 及实现标准 Images API 的中转站 | `b64_json` 或 `url` |
+| OpenAI Chat 生图 | `chat/completions` | 通过 Chat 扩展返回图片的常见中转站 | data URL、Markdown 图片、`message.images` 等 |
+
+协议由用户显式选择，程序不会再根据模型名称猜协议。专有的提交任务 / 轮询结果异步协议差异较大，目前不冒充通用协议；后续可按服务商单独增加适配器。
 
 ## 功能概览
 
 - 本地 Web UI，默认地址 `http://127.0.0.1:7860`
 - 顶部设置区内填写 API Key，不依赖 `.env`
-- 支持 Google AI Studio 官方 Key，也支持 APIYI 这类 Gemini 原生中转
+- 支持 Google Gemini 官方接口、OpenAI Images，以及常见 OpenAI Chat 生图中转
+- Base URL 可填写根域名或带 `/v1` 的地址，不绑定 APIYI
+- 连接测试只读取模型列表，不发送收费生图请求；生成失败不自动重试，避免重复扣费
 - 支持可选代理设置，适合国内网络环境
 - 支持 `Grounding with Google Search` 和 `Image Search`
 - 支持单张拖入 / 上传 / 粘贴参考图，也支持批量拖入多张参考图
@@ -33,6 +45,8 @@
 Google AI Studio API Key 申请地址：
 
 - [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+
+使用 OpenAI 或中转站时，请使用对应平台提供的 Key 和 Base URL，并按其文档选择完全一致的协议。
 
 ## 快速启动
 
@@ -68,9 +82,9 @@ python app.py
 
 ## 使用说明
 
-1. 在顶部“设置”区域填写 API Key。
-2. 如果是 Google 官方 Gemini API，`Gemini Base URL` 留空即可。
-3. 如果是 APIYI 这类 Gemini 原生中转，在 `Gemini Base URL` 填根域名，例如 `https://api.apiyi.com`。
+1. 在顶部“设置”区域选择接口协议并填写 API Key。
+2. 官方接口可将 `Base URL` 留空：Gemini 连接 Google，OpenAI 协议连接 OpenAI。
+3. 使用中转站时，填写其根域名或 `/v1` 地址，并按中转站文档选择 Gemini 原生、OpenAI Images 或 OpenAI Chat 生图。旧的 APIYI 地址仍可正常填写使用。
 4. 如需代理，在“代理”中填写本机 `HTTP` 或 `SOCKS5` 地址。
 5. 在“出图储存位置”中填写主输出目录。
 6. 在“备份目录”中填写你希望保存备份的目录。
@@ -123,7 +137,9 @@ python app.py
 
 - API Key 修改后立即生效，不需要重启
 - `data/config.json` 不存在或 Key 为空时，生成按钮自动禁用
-- 所有 Gemini 请求统一设置为 5 分钟超时
+- 所有生图请求统一设置为 5 分钟超时
+- 单张、批量、参考图编辑、连接测试和模型检测共用同一个协议设置
+- OpenAI 兼容响应可解析 `b64_json`、图片 URL、data URL、Markdown 图片和 `message.images`
 - 对超时、配额不足、权限不足、Key 无效、内容被拒等错误做了友好提示
 - 生成完成后会展示 grounding 查询词和来源摘要（若接口返回）
 
@@ -163,7 +179,7 @@ python app.py
 - `requirements.txt`：依赖列表
 - `Start.bat`：Windows 便携版启动入口
 - `Install_Shortcut.bat`：在桌面创建快捷方式
-- `data/config.json`：本地保存 API Key、代理、Gemini Base URL、主输出目录和备份目录
+- `data/config.json`：本地保存 API Key、接口协议、代理、Base URL、主输出目录和备份目录
 - `data/prompt_history.json`：本地保存最近 Prompt 与基础参数，用于挑选复用
 - `data/conversations.json`：旧版本生成记录文件；当前界面不再写入新的记录
 - `runtime/pycache`：Python 运行缓存，便于和项目代码分开
@@ -182,12 +198,12 @@ python app.py
 
 ### 1. API Key 无效
 
-- 确认 Key 是从 AI Studio 页面复制的完整字符串
-- 确认项目未被禁用，且 Key 仍然有效
+- 确认 Key 是从对应官方平台或中转站复制的完整字符串
+- 确认所选协议、Base URL、Key 和模型属于同一个服务
 
 ### 2. 配额耗尽或 429
 
-- 检查 Google AI Studio / Cloud Billing 是否已启用计费
+- 检查对应服务商的余额、配额或计费状态
 - 稍后重试，避免短时间内连续高频请求
 
 ### 3. 权限不足或 403
@@ -200,7 +216,7 @@ python app.py
 - 这版程序把单次网络请求超时固定为 5 分钟
 - 建议先降低分辨率、减少参考图数量，或改用快速模型
 
-### 5. AI Studio 网页能开，但本地测试连接失败
+### 5. 网页能开，但本地测试连接失败
 
 - 这通常不是 Key 错，而是本地 Python 进程没有走你的浏览器代理
 - 如果你在国内网络环境，请在程序顶部“设置”里填写可用的代理地址
@@ -211,3 +227,5 @@ python app.py
 - [Gemini 图像生成官方文档](https://ai.google.dev/gemini-api/docs/image-generation)
 - [Gemini 3 官方文档](https://ai.google.dev/gemini-api/docs/gemini-3)
 - [Google Gen AI SDK 文档](https://googleapis.github.io/python-genai/)
+- [OpenAI 图像生成官方文档](https://developers.openai.com/api/docs/guides/image-generation)
+- [OpenAI Images API 参考](https://developers.openai.com/api/reference/resources/images)

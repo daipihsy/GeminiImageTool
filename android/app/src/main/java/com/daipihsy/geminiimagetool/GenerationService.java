@@ -69,7 +69,7 @@ public final class GenerationService extends Service {
         Intent openIntent = new Intent(this, MainActivity.class);
         PendingIntent open = PendingIntent.getActivity(this, 0, openIntent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification.Builder builder = new Notification.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Gemini 图像工具").setContentText(text).setStyle(new Notification.BigTextStyle().bigText(text))
+            .setContentTitle("AI 图像工具").setContentText(text).setStyle(new Notification.BigTextStyle().bigText(text))
             .setContentIntent(open).setOngoing(ongoing).setOnlyAlertOnce(true).setAutoCancel(!ongoing);
         if (ongoing) {
             PendingIntent cancel = PendingIntent.getService(this, 1, new Intent(this, GenerationService.class).setAction(CANCEL), PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
