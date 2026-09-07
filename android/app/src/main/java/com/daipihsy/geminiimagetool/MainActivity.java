@@ -49,6 +49,7 @@ import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
     private static final int PICK_IMAGES = 20;
+    private static final String[] PROTOCOL_LABELS = {"Gemini 原生接口", "OpenAI Images 接口", "OpenAI Chat 生图"};
     private static final int BG = Color.rgb(245, 244, 240), INK = Color.rgb(31, 45, 39), GREEN = Color.rgb(37, 90, 70), MUTED = Color.rgb(103, 113, 105);
     private ImageApp app;
     private SharedPreferences prefs;
@@ -87,7 +88,7 @@ public final class MainActivity extends Activity {
             return insets;
         });
         LinearLayout header = horizontal(); header.setGravity(Gravity.CENTER_VERTICAL); header.setPadding(dp(20), dp(15), dp(20), dp(10));
-        LinearLayout titles = vertical(); titles.addView(text("GEMINI STUDIO", 12, GREEN, true)); titles.addView(text("把想法，变成图片", 23, INK, true));
+        LinearLayout titles = vertical(); titles.addView(text("AI IMAGE STUDIO", 12, GREEN, true)); titles.addView(text("把想法，变成图片", 23, INK, true));
         header.addView(titles, new LinearLayout.LayoutParams(0, -2, 1));
         TextView badge = text("安卓版", 12, GREEN, true); badge.setPadding(dp(12), dp(7), dp(12), dp(7)); badge.setBackground(shape(Color.rgb(226, 234, 221), 18)); header.addView(badge);
         root.addView(header); body = vertical(); root.addView(body, new LinearLayout.LayoutParams(-1, 0, 1));
@@ -107,6 +108,7 @@ public final class MainActivity extends Activity {
     }
 
     private void buildCreate() {
+        String currentProtocol = apiProtocol();
         LinearLayout description = card(); description.addView(text("01  /  描述画面", 13, GREEN, true));
         prompt = field("描述你想生成或修改的图片…", prefs.getString("draft", ""), true); prompt.setMinLines(5); prompt.setMaxLines(10); description.addView(prompt);
         description.addView(button("使用历史提示词", false, this::showPromptHistory)); page.addView(description);
@@ -119,17 +121,21 @@ public final class MainActivity extends Activity {
         LinearLayout parameters = card(); parameters.addView(text("03  /  生成参数", 13, GREEN, true));
         parameters.addView(label("模型（可直接输入）"));
         modelInput = new AutoCompleteTextView(this); modelInput.setSingleLine(true); modelInput.setThreshold(0); modelInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS); styleField(modelInput);
-        modelInput.setText(prefs.getString("model", openAi() ? Protocol.GPT : Protocol.BANANA)); modelInput.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_dropdown_item_1line, modelChoices())); parameters.addView(modelInput);
+        modelInput.setText(prefs.getString("model", defaultModel(currentProtocol))); modelInput.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_dropdown_item_1line, modelChoices())); parameters.addView(modelInput);
         parameters.addView(button("选择模型", false, this::chooseModel));
         LinearLayout row = horizontal(); ratio = selector(Protocol.RATIOS, prefs.getString("ratio", "1:1")); resolution = selector(Protocol.RESOLUTIONS, prefs.getString("resolution", "1K"));
         count = selector(new String[]{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, prefs.getString("count", "1"));
         row.addView(labelled("比例", ratio), weighted()); row.addView(labelled("清晰度", resolution), weighted()); row.addView(labelled("张数", count), weighted()); parameters.addView(row);
-        parameters.addView(note(openAi() ? "使用 OpenAI Images 接口。GPT-Image-2-VIP 沿用电脑版尺寸表。" : "非原生比例会生成后居中裁切；Pro 的 512 档由 1K 缩小。"));
+        parameters.addView(note(Protocol.OPENAI_IMAGES.equals(currentProtocol)
+            ? "使用 OpenAI Images 的 generations / edits；GPT-Image-2-VIP 沿用电脑版尺寸表。"
+            : Protocol.OPENAI_CHAT.equals(currentProtocol)
+                ? "使用常见中转站的 Chat Completions 生图扩展；需服务商明确支持图片输出。"
+                : "非原生比例会生成后居中裁切；Pro 的 512 档由 1K 缩小。"));
         LinearLayout advanced = vertical(); advanced.setVisibility(View.GONE); seedInput = field("留空为随机", prefs.getString("seed", ""), false); seedInput.setInputType(InputType.TYPE_CLASS_NUMBER);
         advanced.addView(label("固定种子（可选，每张依次 +1）")); advanced.addView(seedInput);
         webSearch = checkbox("使用 Google 搜索", prefs.getBoolean("web", false)); imageSearch = checkbox("同时使用图片搜索（Nano Banana 2）", prefs.getBoolean("image_search", false));
         advanced.addView(webSearch); advanced.addView(imageSearch);
-        if (openAi()) { seedInput.setEnabled(false); webSearch.setEnabled(false); imageSearch.setEnabled(false); advanced.addView(note("Images 接口不发送种子与搜索参数。")); }
+        if (!Protocol.isGemini(currentProtocol)) { seedInput.setEnabled(false); webSearch.setEnabled(false); imageSearch.setEnabled(false); advanced.addView(note("OpenAI 兼容协议不发送 Gemini 种子与搜索参数。")); }
         parameters.addView(button("高级选项", false, () -> advanced.setVisibility(advanced.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE))); parameters.addView(advanced); page.addView(parameters);
 
         LinearLayout actions = card(); statusLabel = text(app.status, 14, INK, false); statusLabel.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE); actions.addView(statusLabel);
@@ -188,7 +194,7 @@ public final class MainActivity extends Activity {
         try {
             saveDraft(); ApiClient.Options value = options(); value.model = Protocol.modelId(modelInput.getText().toString()); value.prompt = prompt.getText().toString().trim();
             value.ratio = selected(ratio); value.resolution = selected(resolution); value.count = Integer.parseInt(selected(count)); value.references.addAll(app.references);
-            if (!value.openAi) {
+            if (Protocol.isGemini(value.protocol)) {
                 value.webSearch = webSearch.isChecked(); value.imageSearch = imageSearch.isChecked(); String seed = seedInput.getText().toString().trim();
                 if (!seed.isEmpty()) { long n = Long.parseLong(seed); if (n < 0 || n > Integer.MAX_VALUE - 10L) throw new IllegalArgumentException("种子请输入 0–2147483637"); value.seed = n; }
             }
@@ -205,8 +211,8 @@ public final class MainActivity extends Activity {
             .setNegativeButton("继续生成", null).setPositiveButton("停止", (d, w) -> startService(new Intent(this, GenerationService.class).setAction(GenerationService.CANCEL))).show();
     }
     private ApiClient.Options options() {
-        ApiClient.Options value = new ApiClient.Options(); value.openAi = openAi(); value.key = app.apiKey.trim(); value.base = prefs.getString("base", "");
-        value.model = modelInput == null ? prefs.getString("model", value.openAi ? Protocol.GPT : Protocol.BANANA) : modelInput.getText().toString().trim(); return value;
+        ApiClient.Options value = new ApiClient.Options(); value.protocol = apiProtocol(); value.key = app.apiKey.trim(); value.base = prefs.getString("base", "");
+        value.model = modelInput == null ? prefs.getString("model", defaultModel(value.protocol)) : modelInput.getText().toString().trim(); return value;
     }
     private void saveDraft() {
         if (prompt == null) return;
@@ -217,23 +223,25 @@ public final class MainActivity extends Activity {
 
     private void buildSettings() {
         LinearLayout connection = card(); connection.addView(text("连接图像模型", 20, INK, true)); connection.addView(note("手机直接连接服务商，无需开启电脑；网络跟随手机系统和 VPN。"));
-        protocol = selector(new String[]{"Gemini 原生接口", "OpenAI Images 接口"}, openAi() ? "OpenAI Images 接口" : "Gemini 原生接口"); connection.addView(label("接口协议")); connection.addView(protocol);
+        protocol = selector(PROTOCOL_LABELS, protocolLabel(apiProtocol())); connection.addView(label("接口协议")); connection.addView(protocol);
         baseInput = field("留空使用默认地址", prefs.getString("base", ""), false); baseInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI); connection.addView(label("Base URL")); connection.addView(baseInput);
-        connection.addView(note("Gemini 留空连接 Google；OpenAI Images 留空连接 APIYI。自定义地址必须为 HTTPS。"));
+        connection.addView(note("Gemini 留空连接 Google；OpenAI 协议留空连接 OpenAI 官方。中转站可填根域名或 /v1 地址，必须为 HTTPS。"));
         keyInput = field("粘贴 API Key", app.apiKey, false); keyInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD); keyInput.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
         keyInput.setImeOptions(android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING); connection.addView(label("API Key")); connection.addView(keyInput);
         CheckBox reveal = checkbox("显示密钥", false); reveal.setOnCheckedChangeListener((b, checked) -> { keyInput.setInputType(InputType.TYPE_CLASS_TEXT | (checked ? InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD : InputType.TYPE_TEXT_VARIATION_PASSWORD)); keyInput.setSelection(keyInput.length()); }); connection.addView(reveal);
         rememberKey = checkbox("在此手机记住密钥", prefs.getBoolean("remember_key", false)); connection.addView(rememberKey); connection.addView(note("勾选后使用 Android 系统密钥库加密；应用不参与系统备份。"));
         connection.addView(button("保存设置", true, () -> saveSettings(true))); connection.addView(button("检测可用模型 / 测试连接", false, this::detectModels));
         statusLabel = text(app.status, 14, INK, false); connection.addView(statusLabel); page.addView(connection);
-        LinearLayout about = card(); about.addView(text("Gemini 图像工具 · Android", 17, INK, true));
-        about.addView(note("1.0.0-beta1 · 支持 Android 10 及以上\n\n作品先保存在应用内；“存相册”会写入 Pictures/GeminiImageTool。卸载前请保存需要的图片。\n\n检测模型列表不发起收费生图请求。GRSAI 等专有异步接口暂未包含。")); page.addView(about);
+        LinearLayout about = card(); about.addView(text("AI 图像工具 · Android", 17, INK, true));
+        about.addView(note("1.1.0-beta1 · 支持 Android 10 及以上\n\n作品先保存在应用内；“存相册”会写入 Pictures/GeminiImageTool。卸载前请保存需要的图片。\n\n支持 Gemini 原生、OpenAI Images、常见 OpenAI Chat 生图返回。检测模型列表不发起收费生图请求；专有异步接口暂未包含。")); page.addView(about);
     }
     private boolean saveSettings(boolean feedback) {
         try {
-            boolean nextOpenAi = protocol.getSelectedItemPosition() == 1, changed = nextOpenAi != openAi(); String base = baseInput.getText().toString().trim(), key = keyInput.getText().toString().trim();
-            Protocol.baseUrl(base, nextOpenAi); if (key.contains("\n") || key.contains("\r")) throw new IllegalArgumentException("API Key 不能包含换行"); Settings.saveKey(this, key, rememberKey.isChecked());
-            SharedPreferences.Editor edit = prefs.edit().putBoolean("open_ai", nextOpenAi).putString("base", base); if (changed) edit.putString("model", nextOpenAi ? Protocol.GPT : Protocol.BANANA).remove("available_models"); edit.apply(); app.apiKey = key;
+            String nextProtocol = protocolValue(protocol.getSelectedItemPosition()), previousProtocol = apiProtocol();
+            boolean changed = !nextProtocol.equals(previousProtocol); String base = baseInput.getText().toString().trim(), key = keyInput.getText().toString().trim();
+            Protocol.baseUrl(base, nextProtocol); if (key.contains("\n") || key.contains("\r")) throw new IllegalArgumentException("API Key 不能包含换行"); Settings.saveKey(this, key, rememberKey.isChecked());
+            SharedPreferences.Editor edit = prefs.edit().putString("api_protocol", nextProtocol).remove("open_ai").putString("base", base);
+            if (changed) edit.putString("model", defaultModel(nextProtocol)); edit.apply(); app.apiKey = key;
             if (feedback) app.update("设置已保存，可到「创作」开始生成"); return true;
         } catch (Exception e) { app.update("保存失败：" + Protocol.redact(e.getMessage(), app.apiKey)); return false; }
     }
@@ -243,14 +251,18 @@ public final class MainActivity extends Activity {
         io.execute(() -> {
             try {
                 List<String> models = client.detectModels(value);
-                runOnUiThread(() -> { detecting = false; prefs.edit().putString("available_models", String.join("\n", models)).apply(); app.update(models.isEmpty() ? "连接成功，但未筛出图像模型；可在创作页手动输入。" : "连接成功，找到 " + models.size() + " 个图像模型。能否生图以服务商权限为准。"); });
+                runOnUiThread(() -> { detecting = false; prefs.edit().putString(modelsKey(value.protocol), String.join("\n", models)).apply(); app.update(models.isEmpty() ? "连接成功，但未筛出图像模型；可在创作页手动输入。" : "连接成功，找到 " + models.size() + " 个图像模型。能否生图以服务商权限为准。"); });
             } catch (Exception e) { runOnUiThread(() -> { detecting = false; app.update("检测失败：" + Protocol.redact(e.getMessage(), value.key)); }); }
         });
     }
     private void chooseModel() { List<String> values = modelChoices(); new AlertDialog.Builder(this).setTitle("选择图像模型").setItems(values.toArray(new String[0]), (d, i) -> modelInput.setText(values.get(i))).setNegativeButton("取消", null).show(); }
     private List<String> modelChoices() {
-        List<String> result = new ArrayList<>(openAi() ? Arrays.asList(Protocol.GPT) : Arrays.asList(Protocol.BANANA, Protocol.PRO));
-        for (String value : prefs.getString("available_models", "").split("\n")) if (!value.isEmpty() && !result.contains(value)) result.add(value); return result;
+        String currentProtocol = apiProtocol();
+        List<String> result = new ArrayList<>(Protocol.OPENAI_IMAGES.equals(currentProtocol)
+            ? Arrays.asList(Protocol.GPT) : Arrays.asList(Protocol.BANANA, Protocol.PRO));
+        String stored = prefs.getString(modelsKey(currentProtocol), "");
+        if (stored.isEmpty() && Protocol.GEMINI.equals(currentProtocol)) stored = prefs.getString("available_models", "");
+        for (String value : stored.split("\n")) if (!value.isEmpty() && !result.contains(value)) result.add(value); return result;
     }
     private void showPromptHistory() {
         JSONArray history = Store.prompts(this); if (history.length() == 0) { toast("生成后，提示词会自动保存在这里"); return; }
@@ -304,7 +316,17 @@ public final class MainActivity extends Activity {
         if (tab == 1 && shownCompleted != app.completed) { shownCompleted = app.completed; renderGallery(); }
     }
 
-    private boolean openAi() { return prefs.getBoolean("open_ai", false); }
+    private String apiProtocol() {
+        String stored = prefs.getString("api_protocol", "");
+        if (!stored.isEmpty()) return Protocol.normalizeProtocol(stored);
+        return prefs.getBoolean("open_ai", false) ? Protocol.OPENAI_IMAGES : Protocol.GEMINI;
+    }
+    private String defaultModel(String value) { return Protocol.OPENAI_IMAGES.equals(Protocol.normalizeProtocol(value)) ? Protocol.GPT : Protocol.BANANA; }
+    private String modelsKey(String value) { return "available_models_" + Protocol.normalizeProtocol(value); }
+    private String protocolLabel(String value) {
+        return Protocol.OPENAI_IMAGES.equals(value) ? PROTOCOL_LABELS[1] : Protocol.OPENAI_CHAT.equals(value) ? PROTOCOL_LABELS[2] : PROTOCOL_LABELS[0];
+    }
+    private String protocolValue(int position) { return position == 1 ? Protocol.OPENAI_IMAGES : position == 2 ? Protocol.OPENAI_CHAT : Protocol.GEMINI; }
     private String selected(Spinner spinner) { return spinner.getSelectedItem().toString(); }
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
     private void toast(String message) { Toast.makeText(getApplicationContext(), message, Toast.LENGTH_LONG).show(); }

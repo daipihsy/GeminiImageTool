@@ -89,9 +89,14 @@ final class Store {
         BitmapFactory.decodeByteArray(result.bytes, 0, result.bytes.length, info);
         if (info.outWidth <= 0 || info.outHeight <= 0 || (long) info.outWidth * info.outHeight > 40_000_000L)
             throw new IOException("接口返回图片无法识别或过大");
-        String id = "Gemini-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new Date()) + "-" + UUID.randomUUID().toString().substring(0, 8);
-        boolean crop = !options.openAi && !"自适应".equals(options.ratio) && !Protocol.apiRatio(options.model, options.ratio).equals(options.ratio);
-        boolean resize = !options.openAi && !Protocol.apiResolution(options.model, options.resolution).equals(options.resolution);
+        String id = "AI-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new Date()) + "-" + UUID.randomUUID().toString().substring(0, 8);
+        boolean crop = false;
+        if (!"自适应".equals(options.ratio)) {
+            String[] parts = options.ratio.split(":");
+            double desired = Double.parseDouble(parts[0]) / Double.parseDouble(parts[1]);
+            crop = Math.abs((double) info.outWidth / info.outHeight - desired) > 0.005;
+        }
+        boolean resize = Protocol.isGemini(options.protocol) && !Protocol.apiResolution(options.model, options.resolution).equals(options.resolution);
         File target = new File(outputs(c), id + (crop || resize ? ".png" : "." + ApiClient.extension(info.outMimeType == null ? "image/png" : info.outMimeType)));
         int width = info.outWidth, height = info.outHeight;
         if (crop || resize) {
@@ -117,7 +122,7 @@ final class Store {
         JSONObject meta = new JSONObject().put("file", target.getName()).put("prompt", options.prompt).put("model", options.model)
             .put("ratio", options.ratio).put("resolution", options.resolution).put("width", width).put("height", height)
             .put("created", System.currentTimeMillis()).put("sources", result.sources).put("cropped", crop);
-        if (options.seed != null && !options.openAi) meta.put("seed", options.seed + index);
+        if (options.seed != null && Protocol.isGemini(options.protocol)) meta.put("seed", options.seed + index);
         write(new File(outputs(c), id + ".json"), meta.toString()); return meta;
     }
 

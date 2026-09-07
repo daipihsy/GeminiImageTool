@@ -11,7 +11,7 @@
         android:fullBackupContent="@xml/backup_rules"
         android:usesCleartextTraffic="false"
         android:icon="@drawable/ic_launcher"
-        android:label="Gemini 图像工具"
+        android:label="AI 图像工具"
         android:theme="@style/AppTheme">
         <activity android:name=".MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
             <intent-filter>
