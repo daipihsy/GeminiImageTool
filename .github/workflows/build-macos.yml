@@ -5,14 +5,29 @@ on:
     inputs:
       release_tag:
         description: "Release tag to attach the .dmg to (e.g. v2.2.1)"
-        required: true
-        default: "v2.2.1"
+        required: false
+        default: ""
   push:
+    branches: [main]
     tags:
       - "v*"
+    paths:
+      - "app.py"
+      - "requirements.txt"
+      - "assets/**"
+      - ".github/workflows/build-macos.yml"
+  pull_request:
+    paths:
+      - "app.py"
+      - "requirements.txt"
+      - "assets/**"
+      - ".github/workflows/build-macos.yml"
 
 permissions:
   contents: write
+
+env:
+  DESKTOP_BETA_RELEASE_TAG: v2.3.0-beta.1
 
 jobs:
   build-macos:
@@ -34,6 +49,20 @@ jobs:
 
       - name: Import sanity check (source)
         run: python -c "import app; app.build_demo(); print('build_demo OK on macOS')"
+
+      - name: Resolve release tag
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          TAG="$REQUESTED_RELEASE_TAG"
+          if [ -z "$TAG" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              TAG="$GITHUB_REF_NAME"
+            else
+              TAG="$DESKTOP_BETA_RELEASE_TAG"
+            fi
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: Build macOS app icon
         run: |
@@ -86,20 +115,19 @@ jobs:
           mkdir -p dmg_root
           cp -R "dist/GeminiImageTool.app" dmg_root/
           ln -s /Applications dmg_root/Applications
-          TAG="${{ github.event.inputs.release_tag || github.ref_name }}"
           hdiutil create -volname "GeminiImageTool" -srcfolder dmg_root -ov -format UDZO \
-            "GeminiImageTool-macOS-${TAG}.dmg"
+            "GeminiImageTool-macOS-${RELEASE_TAG}.dmg"
           ls -lh *.dmg
 
       - name: Upload .dmg to Release
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.event.inputs.release_tag || github.ref_name }}"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "GeminiImageTool $TAG" --notes "Automated build."
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --title "GeminiImageTool $RELEASE_TAG" --notes "Automated build."
           fi
-          gh release upload "$TAG" GeminiImageTool-macOS-*.dmg --clobber
+          gh release upload "$RELEASE_TAG" GeminiImageTool-macOS-*.dmg --clobber
 
       - name: Upload build artifact (fallback)
         if: always()
