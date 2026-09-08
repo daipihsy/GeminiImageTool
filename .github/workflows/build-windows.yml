@@ -86,7 +86,11 @@ jobs:
       - name: Smoke test the built app
         shell: pwsh
         run: |
-          $env:GRADIO_SERVER_PORT = '7860'
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+          $listener.Start()
+          $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+          $listener.Stop()
+          $env:GRADIO_SERVER_PORT = "$port"
           $binary = (Resolve-Path 'dist/GeminiImageTool/GeminiImageTool.exe').Path
           $workingDirectory = (Resolve-Path 'dist/GeminiImageTool').Path
           $process = Start-Process -FilePath $binary -WorkingDirectory $workingDirectory -PassThru
@@ -94,7 +98,8 @@ jobs:
           try {
             for ($i = 0; $i -lt 60; $i++) {
               Start-Sleep -Seconds 2
-              & curl.exe -fsS --max-time 2 'http://127.0.0.1:7860/' --output NUL
+              if ($process.HasExited) { throw "Built app exited early with code $($process.ExitCode)." }
+              & curl.exe -fsS --max-time 2 "http://127.0.0.1:$port/" --output NUL
               if ($LASTEXITCODE -eq 0) {
                 $ok = $true
                 break
@@ -103,7 +108,7 @@ jobs:
           } finally {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
           }
-          if (-not $ok) { throw 'Built app did not serve the UI on port 7860.' }
+          if (-not $ok) { throw "Built app did not serve the UI on port $port." }
 
       - name: Build Windows installer
         shell: pwsh
