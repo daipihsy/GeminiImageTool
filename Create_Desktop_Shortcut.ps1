@@ -10,7 +10,7 @@ try {
     $lnk.TargetPath = Join-Path $appDir 'python\pythonw.exe'
     $lnk.Arguments = '"app.py"'
     $lnk.WorkingDirectory = $appDir
-    $lnk.IconLocation = Join-Path $appDir 'python\pythonw.exe'
+    $lnk.IconLocation = Join-Path $appDir 'assets\GeminiImageTool.ico'
     $lnk.Description = 'GeminiImageTool'
     $lnk.Save()
 } catch {

@@ -30,8 +30,9 @@ OutputBaseFilename={#MyAppName}_Setup_v{#MyAppVersion}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=..\assets\GeminiImageTool.ico
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
-UninstallDisplayIcon={app}\python\pythonw.exe
+UninstallDisplayIcon={app}\assets\GeminiImageTool.ico
 DisableDirPage=no
 DisableReadyPage=no
 
@@ -45,7 +46,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式 / Create a desktop s
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: """app.py"""; WorkingDir: "{app}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\python\pythonw.exe"; Parameters: """app.py"""; WorkingDir: "{app}"; IconFilename: "{app}\assets\GeminiImageTool.ico"
 Name: "{group}\{#MyAppName} (Console Mode)"; Filename: "{app}\Start.bat"; WorkingDir: "{app}"
 Name: "{group}\创建桌面快捷方式 (Create Desktop Shortcut)"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Create_Desktop_Shortcut.ps1"""; WorkingDir: "{app}"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
@@ -72,7 +73,7 @@ begin
     Shortcut.TargetPath := ExpandConstant('{app}\python\pythonw.exe');
     Shortcut.Arguments := '"app.py"';
     Shortcut.WorkingDirectory := ExpandConstant('{app}');
-    Shortcut.IconLocation := ExpandConstant('{app}\python\pythonw.exe');
+    Shortcut.IconLocation := ExpandConstant('{app}\assets\GeminiImageTool.ico');
     Shortcut.Description := '{#MyAppName}';
     Shortcut.Save;
   except
