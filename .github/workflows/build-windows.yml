@@ -1,0 +1,138 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional release tag to attach the installer to"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - "app.py"
+      - "requirements.txt"
+      - "assets/**"
+      - "packaging/GeminiImageTool-PyInstaller.iss"
+      - ".github/workflows/build-windows.yml"
+  pull_request:
+    paths:
+      - "app.py"
+      - "requirements.txt"
+      - "assets/**"
+      - "packaging/GeminiImageTool-PyInstaller.iss"
+      - ".github/workflows/build-windows.yml"
+
+permissions:
+  contents: write
+
+env:
+  DESKTOP_BETA_RELEASE_TAG: v2.3.0-beta.1
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Import sanity check
+        run: python -c "import app; app.build_demo(); print('build_demo OK on Windows')"
+
+      - name: Resolve release tag
+        shell: pwsh
+        env:
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $tag = $env:REQUESTED_RELEASE_TAG
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            if ($env:GITHUB_REF -like 'refs/tags/v*') {
+              $tag = $env:GITHUB_REF_NAME
+            } else {
+              $tag = $env:DESKTOP_BETA_RELEASE_TAG
+            }
+          }
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build branded Windows app
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name GeminiImageTool `
+            --icon assets/GeminiImageTool.ico `
+            --collect-all gradio `
+            --collect-all gradio_client `
+            --collect-all safehttpx `
+            --collect-all groovy `
+            --copy-metadata gradio `
+            --copy-metadata gradio_client `
+            --copy-metadata safehttpx `
+            --copy-metadata groovy `
+            --collect-all google.genai `
+            --copy-metadata google-genai `
+            app.py
+
+      - name: Smoke test the built app
+        shell: pwsh
+        run: |
+          $env:GRADIO_SERVER_PORT = '7860'
+          $binary = (Resolve-Path 'dist/GeminiImageTool/GeminiImageTool.exe').Path
+          $workingDirectory = (Resolve-Path 'dist/GeminiImageTool').Path
+          $process = Start-Process -FilePath $binary -WorkingDirectory $workingDirectory -PassThru
+          $ok = $false
+          try {
+            for ($i = 0; $i -lt 45; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:7860/' -TimeoutSec 2 | Out-Null
+                $ok = $true
+                break
+              } catch {}
+            }
+          } finally {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+          }
+          if (-not $ok) { throw 'Built app did not serve the UI on port 7860.' }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw 'Inno Setup 6 was not found on the runner.' }
+          $stage = (Resolve-Path 'dist/GeminiImageTool').Path
+          $output = (Get-Location).Path
+          $icon = (Resolve-Path 'assets/GeminiImageTool.ico').Path
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          & $iscc "/DStageDir=$stage" "/DOutputDir=$output" "/DIconFile=$icon" "/DMyAppVersion=$version" packaging/GeminiImageTool-PyInstaller.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeminiImageTool-Windows
+          path: GeminiImageTool-Windows-Setup-*.exe
+          retention-days: 30
+
+      - name: Upload Windows installer to GitHub Release
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG --title "GeminiImageTool $env:RELEASE_TAG" --notes 'Automated build.'
+          }
+          gh release upload $env:RELEASE_TAG GeminiImageTool-Windows-Setup-*.exe --clobber
+
