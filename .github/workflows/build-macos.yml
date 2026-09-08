@@ -35,9 +35,25 @@ jobs:
       - name: Import sanity check (source)
         run: python -c "import app; app.build_demo(); print('build_demo OK on macOS')"
 
+      - name: Build macOS app icon
+        run: |
+          mkdir -p GeminiImageTool.iconset
+          sips -z 16 16 assets/GeminiImageTool-icon.png --out GeminiImageTool.iconset/icon_16x16.png
+          sips -z 32 32 assets/GeminiImageTool-icon.png --out GeminiImageTool.iconset/icon_16x16@2x.png
+          sips -z 32 32 assets/GeminiImageTool-icon.png --out GeminiImageTool.iconset/icon_32x32.png
+          sips -z 64 64 assets/GeminiImageTool-icon.png --out GeminiImageTool.iconset/icon_32x32@2x.png
+          sips -z 128 128 assets/GeminiImageTool-icon.png --out GeminiImageTool.iconset/icon_128x128.png
+          sips -z 256 256 assets/GeminiImageTool-icon.png --out GeminiImageTool.iconset/icon_128x128@2x.png
+          sips -z 256 256 assets/GeminiImageTool-icon.png --out GeminiImageTool.iconset/icon_256x256.png
+          sips -z 512 512 assets/GeminiImageTool-icon.png --out GeminiImageTool.iconset/icon_256x256@2x.png
+          sips -z 512 512 assets/GeminiImageTool-icon.png --out GeminiImageTool.iconset/icon_512x512.png
+          cp assets/GeminiImageTool-icon.png GeminiImageTool.iconset/icon_512x512@2x.png
+          iconutil -c icns GeminiImageTool.iconset -o GeminiImageTool.icns
+
       - name: Build .app with PyInstaller
         run: |
           pyinstaller --noconfirm --clean --windowed --name GeminiImageTool \
+            --icon GeminiImageTool.icns \
             --collect-all gradio \
             --collect-all gradio_client \
             --collect-all safehttpx \
