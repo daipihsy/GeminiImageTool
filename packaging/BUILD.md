@@ -12,6 +12,11 @@
 
 ## 打包成安装程序 (Windows)
 
+合并到 `main` 后，GitHub Actions 会在 Windows runner 上使用 PyInstaller 和
+`packaging/GeminiImageTool-PyInstaller.iss` 自动生成带品牌图标的安装程序，并上传到当前 Beta Release。
+
+以下步骤保留给需要内置便携 Python 目录的本地打包方式：
+
 1. 装 [Inno Setup 6](https://jrsoftware.org/isdl.php)。
 2. 准备一个**干净的完整便携目录**（含 `python/` + `app.py` + 支持文件，不含 `data/config.json`、`outputs/`、`__pycache__`、`unins000.*`、`*.bak`）。
 3. 编辑 `packaging/GeminiImageTool.iss`，把 `StageDir` 指向该目录。
