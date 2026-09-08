@@ -92,13 +92,13 @@ jobs:
           $process = Start-Process -FilePath $binary -WorkingDirectory $workingDirectory -PassThru
           $ok = $false
           try {
-            for ($i = 0; $i -lt 45; $i++) {
+            for ($i = 0; $i -lt 60; $i++) {
               Start-Sleep -Seconds 2
-              try {
-                Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:7860/' -TimeoutSec 2 | Out-Null
+              & curl.exe -fsS --max-time 2 'http://127.0.0.1:7860/' --output NUL
+              if ($LASTEXITCODE -eq 0) {
                 $ok = $true
                 break
-              } catch {}
+              }
             }
           } finally {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
@@ -135,4 +135,3 @@ jobs:
             gh release create $env:RELEASE_TAG --title "GeminiImageTool $env:RELEASE_TAG" --notes 'Automated build.'
           }
           gh release upload $env:RELEASE_TAG GeminiImageTool-Windows-Setup-*.exe --clobber
-
