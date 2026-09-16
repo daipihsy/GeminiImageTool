@@ -15,7 +15,7 @@ from html import escape
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Callable, Any
 from uuid import uuid4
 
 import gradio as gr
@@ -107,10 +107,15 @@ QUALITY_CHOICES = ["auto", "low", "medium", "high", "xhigh", "max"]
 # RollDek 文档：宽高须为 16 的倍数，比例 1:3～3:1，最大 3840x2160（按像素总量封顶）。
 MAX_IMAGE_PIXELS = 3840 * 2160
 MAX_IMAGE_SIDE = 3840
-# 实测 RollDek 的请求体上限约 8MB，超过时服务端直接断开连接（报 Server disconnected）。
-# 参考图总量留足余量；Chat 协议要 base64 编码（体积 ×4/3），预算再收紧。
-REFERENCE_UPLOAD_BUDGET_BYTES = 6 * 1024 * 1024
-REFERENCE_UPLOAD_BUDGET_BYTES_BASE64 = int(REFERENCE_UPLOAD_BUDGET_BYTES * 3 / 4)
+# 中转站通常限制请求体大小，超限时直接断开连接（报 Server disconnected）。
+# 上限按端点自动探测并缓存；探测失败时退回 RollDek 的实测值 8MB。
+DEFAULT_REQUEST_BODY_LIMIT = 8 * 1024 * 1024
+# 探测用的模型名故意不存在：服务端读完请求体后只会报“模型不存在”，不生图、不计费。
+BODY_LIMIT_PROBE_MODEL_ID = "gemini-image-tool-size-probe"
+BODY_LIMIT_PROBE_PRECISION = 128 * 1024
+BODY_LIMIT_MARGIN = 4 * 1024
+# 参考图逐级压缩时最多缩到这个最长边，再小就宁可报错让用户减图。
+MIN_REFERENCE_LONGEST_SIDE = 1024
 GPT_IMAGE_2_VIP_SIZES = {
     "1K": {
         "1:1": "1280x1280",
@@ -782,9 +787,13 @@ def save_runtime_settings(
     backup_root: str,
     remember_api_key: bool,
 ) -> None:
-    """保存 API Key、协议、代理、Base URL、输出目录和备份目录。"""
-    write_json_file(
-        CONFIG_PATH,
+    """保存 API Key、协议、代理、Base URL、输出目录和备份目录。
+
+    只更新这几项，保留配置里的其他字段（已检测的模型列表、请求体上限缓存等）；
+    以前整份覆盖写入，每点一次「保存设置」这些缓存都会丢。
+    """
+    data = load_config()
+    data.update(
         {
             "api_key": normalize_api_key(api_key) if remember_api_key else "",
             "proxy_url": normalize_proxy_url(proxy_url),
@@ -792,8 +801,9 @@ def save_runtime_settings(
             "api_protocol": normalize_api_protocol(api_protocol),
             "output_root": str(normalize_output_root(output_root)),
             "backup_root": str(normalize_backup_root(backup_root)),
-        },
+        }
     )
+    write_json_file(CONFIG_PATH, data)
 
 
 def normalize_prompt_history_params(params: dict[str, Any] | None) -> dict[str, Any]:
@@ -1570,86 +1580,268 @@ def extract_openai_image(
     return image.convert("RGBA") if keep_alpha and image.mode in ("RGBA", "LA", "P") else image.convert("RGB")
 
 
-def _encode_reference(image: Image.Image, keep_alpha: bool) -> tuple[bytes, str, str]:
-    """按是否含透明通道选择编码：透明用 PNG，不透明用高质量 JPEG。"""
-    buffer = BytesIO()
-    if keep_alpha:
-        image.convert("RGBA").save(buffer, format="PNG", optimize=True)
-        return buffer.getvalue(), "image/png", ".png"
-    image.convert("RGB").save(buffer, format="JPEG", quality=92, optimize=True)
-    return buffer.getvalue(), "image/jpeg", ".jpg"
+def _has_real_alpha(image: Image.Image) -> bool:
+    """是否真的有透明像素；名义 RGBA 但全不透明的图（截图、导出图常见）按不透明处理。"""
+    if image.mode not in ("RGBA", "LA", "PA") and not (
+        image.mode == "P" and "transparency" in image.info
+    ):
+        return False
+    alpha_min, _ = image.convert("RGBA").getchannel("A").getextrema()
+    return alpha_min < 255
 
 
-def shrink_reference_images(
-    paths: list[str],
-    total_budget: int,
-) -> tuple[list[tuple[str, bytes, str]], str | None]:
-    """把参考图总大小压到预算以内，返回 [(文件名, 字节, MIME)] 和说明文字。
+def _reference_variants(name: str, data: bytes, mime_type: str):
+    """由轻到重依次产出参考图的候选编码 (文件名, 字节, MIME, 说明)。
 
-    这里缩的是**输入参考图**，不影响输出分辨率；小于预算的图原样上传。
-    依次尝试：原尺寸重新编码 → 最长边 2048 → 1536 → 1280 → 1024 → 768。
+    第一项永远是原图。之后：
+    - 不透明图：原尺寸 JPEG q95 → q92 → 每步缩到 90% 尺寸（q92）
+    - 透明图：原尺寸无损 PNG 重编码 → 每步缩到 90% 尺寸（PNG）
+    最长边不低于 MIN_REFERENCE_LONGEST_SIDE。
     """
-    items = []
+    yield name, data, mime_type, "原图"
+    with Image.open(BytesIO(data)) as opened:
+        opened.load()
+        source = opened.copy()
+    keep_alpha = _has_real_alpha(source)
+    stem = Path(name).stem
+    longest = max(source.size)
+
+    scales = [1.0]
+    scale = 1.0
+    while longest * scale * 0.9 >= MIN_REFERENCE_LONGEST_SIDE:
+        scale *= 0.9
+        scales.append(scale)
+    if longest > MIN_REFERENCE_LONGEST_SIDE and longest * scales[-1] > MIN_REFERENCE_LONGEST_SIDE:
+        scales.append(MIN_REFERENCE_LONGEST_SIDE / longest)
+
+    for scale in scales:
+        if scale == 1.0:
+            candidate = source
+        else:
+            candidate = source.resize(
+                (max(1, round(source.width * scale)), max(1, round(source.height * scale))),
+                Image.LANCZOS,
+            )
+        size_label = f"{candidate.width}x{candidate.height}"
+        if keep_alpha:
+            buffer = BytesIO()
+            candidate.convert("RGBA").save(buffer, format="PNG", optimize=True)
+            yield f"{stem}.png", buffer.getvalue(), "image/png", f"PNG {size_label}"
+            continue
+        rgb = candidate.convert("RGB")
+        for quality in ((95, 92) if scale == 1.0 else (92,)):
+            buffer = BytesIO()
+            rgb.save(buffer, format="JPEG", quality=quality, optimize=True, subsampling=0)
+            yield f"{stem}.jpg", buffer.getvalue(), "image/jpeg", f"JPEG q{quality} {size_label}"
+
+
+def fit_references_to_limit(
+    paths: list[str],
+    measure_body: Callable[[list[tuple[str, bytes, str]]], int],
+    body_limit: int,
+) -> tuple[list[tuple[str, bytes, str]], list[str]]:
+    """逐级压缩参考图，直到整个请求体不超过 body_limit，尽量少损失画质。
+
+    每一轮只把**当前最大**的那张往下压一档，放得下立即停止，
+    因此只会压到刚好够用，不会一步压到底。
+    """
+    states = []
     for raw_path in paths:
         path = Path(raw_path)
-        items.append([path.name, path.read_bytes(), guess_mime_type(path)])
-    total = sum(len(data) for _, data, _ in items)
-    if total <= total_budget:
-        return [tuple(item) for item in items], None
-
-    # 已经足够小的图原样保留，剩余预算平分给大图。
-    fair_share = total_budget // len(items)
-    small_total = sum(len(data) for _, data, _ in items if len(data) <= fair_share)
-    large = [item for item in items if len(item[1]) > fair_share]
-    per_large_budget = max(1, (total_budget - small_total) // max(1, len(large)))
-
-    changed = []
-    for item in large:
-        name, data, _ = item
-        with Image.open(BytesIO(data)) as opened:
-            opened.load()
-            source = opened.copy()
-        keep_alpha = source.mode in ("RGBA", "LA") or (
-            source.mode == "P" and "transparency" in source.info
+        data = path.read_bytes()
+        variants = _reference_variants(path.name, data, guess_mime_type(path))
+        states.append(
+            {
+                "variants": variants,
+                "current": next(variants),
+                "source": (path.name, len(data)),
+                "exhausted": False,
+            }
         )
-        if keep_alpha:
-            # 名义上带透明通道、实际全不透明（截图、导出图常见）时改走 JPEG，保住分辨率。
-            alpha_min, _ = source.convert("RGBA").getchannel("A").getextrema()
-            keep_alpha = alpha_min < 255
-        original_size = source.size
-        longest = max(source.size)
-        encoded = None
-        for side in (longest, 2048, 1536, 1280, 1024, 768):
-            if side > longest:
-                continue
-            candidate = source if side == longest else resize_longest_side(source, side)
-            encoded = _encode_reference(candidate, keep_alpha)
-            if len(encoded[0]) <= per_large_budget:
+
+    def current_items() -> list[tuple[str, bytes, str]]:
+        return [state["current"][:3] for state in states]
+
+    body_size = measure_body(current_items())
+    while body_size > body_limit:
+        candidates = [state for state in states if not state["exhausted"]]
+        if not candidates:
+            raise RuntimeError(
+                f"参考图已压到最长边 {MIN_REFERENCE_LONGEST_SIDE}px，请求体仍有 "
+                f"{body_size / 1048576:.1f}MB，超过中转站上限 {body_limit / 1048576:.1f}MB。"
+                "请减少参考图数量后重试。"
+            )
+        target = max(candidates, key=lambda state: len(state["current"][1]))
+        current_length = len(target["current"][1])
+        while True:
+            variant = next(target["variants"], None)
+            if variant is None:
+                target["exhausted"] = True
                 break
-        new_bytes, new_mime, new_ext = encoded
-        item[0] = Path(name).stem + new_ext
-        item[1] = new_bytes
-        item[2] = new_mime
-        new_size = candidate.size
-        changed.append(
-            f"`{name}` {len(data) / 1048576:.1f}MB"
-            f"{f' {original_size[0]}x{original_size[1]}' if new_size != original_size else ''}"
-            f" → {len(new_bytes) / 1048576:.1f}MB"
-            f"{f' {new_size[0]}x{new_size[1]}' if new_size != original_size else ''}"
-        )
+            if len(variant[1]) < current_length:  # 只接受确实变小的档位
+                target["current"] = variant
+                break
+        body_size = measure_body(current_items())
 
-    new_total = sum(len(data) for _, data, _ in items)
-    if new_total > total_budget:
-        raise RuntimeError(
-            f"参考图总大小 {new_total / 1048576:.1f}MB，压缩后仍超过上传上限 "
-            f"{total_budget / 1048576:.1f}MB。请减少参考图数量后重试。"
-        )
+    changes = []
+    for state in states:
+        label = state["current"][3]
+        if label != "原图":
+            name, original_length = state["source"]
+            changes.append(
+                f"`{name}` {original_length / 1048576:.1f}MB → "
+                f"{len(state['current'][1]) / 1048576:.1f}MB（{label}）"
+            )
+    return current_items(), changes
+
+
+def _load_body_limit_cache() -> dict[str, dict[str, int]]:
+    cache = load_config().get("request_body_limits")
+    return cache if isinstance(cache, dict) else {}
+
+
+def _save_body_limit(url: str, accepted: int | None = None, rejected: int | None = None) -> None:
+    """记录某个端点已知可接受 / 已知被拒的请求体大小。"""
+    data = load_config()
+    cache = data.get("request_body_limits")
+    if not isinstance(cache, dict):
+        cache = {}
+    entry = cache.get(url) if isinstance(cache.get(url), dict) else {}
+    if accepted is not None:
+        entry["accepted"] = max(int(entry.get("accepted", 0)), accepted)
+        if entry.get("rejected") and entry["rejected"] <= entry["accepted"]:
+            entry.pop("rejected")
+    if rejected is not None:
+        entry["rejected"] = min(int(entry.get("rejected", rejected)), rejected)
+        if entry.get("accepted", 0) >= entry["rejected"]:
+            entry["accepted"] = 0
+    cache[url] = entry
+    data["request_body_limits"] = cache
+    write_json_file(CONFIG_PATH, data)
+
+
+def _is_body_rejection(exc: Exception) -> bool:
+    return isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError))
+
+
+def probe_body_accepted(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    body_kind: str,
+    body_size: int,
+) -> bool | None:
+    """发送指定大小的探测请求：True=服务端读完了请求体，False=被大小限制拦截，None=无法判断。
+
+    服务端拒绝超大请求时会关闭连接，连接池若复用这条已断开的连接，
+    下一次正常大小的探测也会报断连，造成误判。因此每次探测都用新连接，
+    且判定“被拒”前再确认一次。
+    """
+    headers = {**headers, "Connection": "close"}
+    if body_kind == "multipart":
+        form = {"model": BODY_LIMIT_PROBE_MODEL_ID, "prompt": "size probe"}
+
+        def build(length: int) -> httpx.Request:
+            return client.build_request(
+                "POST", url, headers=headers, data=form,
+                files=[("image[]", ("probe.bin", bytes(length), "application/octet-stream"))],
+            )
+    else:
+        def build(length: int) -> httpx.Request:
+            body = {
+                "model": BODY_LIMIT_PROBE_MODEL_ID,
+                "messages": [{"role": "user", "content": "a" * length}],
+            }
+            return client.build_request("POST", url, headers=headers, json=body)
+
+    overhead = request_body_size(build(0))
+
+    def attempt() -> bool | None:
+        try:
+            response = client.send(build(max(0, body_size - overhead)))
+        except httpx.HTTPError as exc:
+            return False if _is_body_rejection(exc) else None
+        response.close()
+        return response.status_code != 413
+
+    verdict = attempt()
+    if verdict is False:
+        verdict = attempt()  # 断连也可能是偶发网络问题，两次都被拒才算数
+    return verdict
+
+
+def resolve_body_limit(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    body_kind: str,
+    needed: int,
+) -> tuple[int, str | None]:
+    """返回该端点可放心使用的请求体上限，以及（若本次做了探测）说明文字。"""
+    entry = _load_body_limit_cache().get(url, {})
+    accepted = int(entry.get("accepted") or 0)
+    rejected = int(entry.get("rejected") or 0)
+    if accepted >= needed:
+        return needed, None
+    if rejected and needed >= rejected and accepted and rejected - accepted <= BODY_LIMIT_PROBE_PRECISION:
+        return accepted - BODY_LIMIT_MARGIN, None
+
+    verdict = probe_body_accepted(client, url, headers, body_kind, needed)
+    if verdict is None:
+        fallback = min(needed, DEFAULT_REQUEST_BODY_LIMIT) - BODY_LIMIT_MARGIN
+        return fallback, f"未能探测中转站的请求上限，按默认 {DEFAULT_REQUEST_BODY_LIMIT / 1048576:.0f}MB 处理"
+    if verdict:
+        _save_body_limit(url, accepted=needed)
+        return needed, None
+
+    low, high = accepted, min(needed, rejected) if rejected else needed
+    while high - low > BODY_LIMIT_PROBE_PRECISION:
+        middle = (low + high) // 2
+        verdict = probe_body_accepted(client, url, headers, body_kind, middle)
+        if verdict is None:
+            break
+        if verdict:
+            low = middle
+        else:
+            high = middle
+    if low <= 0:
+        low = DEFAULT_REQUEST_BODY_LIMIT
+    _save_body_limit(url, accepted=low, rejected=high)
+    return low - BODY_LIMIT_MARGIN, f"已探测到中转站请求上限约 {low / 1048576:.1f}MB 并缓存"
+
+
+def request_body_size(request: httpx.Request) -> int:
+    """请求体的实际字节数。"""
+    length = request.headers.get("content-length")
+    if length is not None:
+        return int(length)
+    return len(request.read())
+
+
+def prepare_reference_uploads(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    body_kind: str,
+    paths: list[str],
+    measure_body: Callable[[list[tuple[str, bytes, str]]], int],
+) -> tuple[list[tuple[str, bytes, str]], str | None]:
+    """按中转站真实上限准备参考图：放得下就原样上传，放不下才逐级压到刚好放得下。"""
+    originals = [
+        (Path(p).name, Path(p).read_bytes(), guess_mime_type(Path(p))) for p in paths
+    ]
+    needed = measure_body(originals)
+    limit, probe_note = resolve_body_limit(client, url, headers, body_kind, needed)
+    if needed <= limit:
+        return originals, None
+    items, changes = fit_references_to_limit(paths, measure_body, limit)
     note = (
-        f"参考图总大小 {total / 1048576:.1f}MB 超过中转站请求上限，已自动压缩后上传："
-        + "；".join(changed)
-        + "。这只影响参考图，不影响出图分辨率。"
+        f"请求体 {needed / 1048576:.1f}MB 超过中转站上限，已按上限 {limit / 1048576:.1f}MB "
+        f"最小幅度压缩参考图：" + "；".join(changes) + "。只影响参考图，不影响出图分辨率。"
     )
-    return [tuple(item) for item in items], note
+    if probe_note:
+        note += f"（{probe_note}）"
+    return items, note
 
 
 def bytes_to_data_url(data: bytes, mime_type: str) -> str:
@@ -1694,30 +1886,27 @@ def generate_openai_image(
         and get_model_meta(model_id).get("supports_quality", True)
     )
 
-    upload_items, upload_note = (
-        shrink_reference_images(list(reference_paths), REFERENCE_UPLOAD_BUDGET_BYTES)
-        if reference_paths
-        else ([], None)
-    )
+    edits_url = build_openai_url(api_base_url, "/images/edits")
+    image_field = "image" if model_id == GPT_IMAGE_2_VIP_MODEL_ID else "image[]"
+    upload_items: list[tuple[str, bytes, str]] = []
+    upload_note: str | None = None
+
+    def build_edit_request(
+        client: httpx.Client, size_text: str, items: list[tuple[str, bytes, str]]
+    ) -> httpx.Request:
+        data = {"model": model_id, "prompt": prompt}
+        if size_text != "auto":
+            data["size"] = size_text
+        if send_quality:
+            data["quality"] = clean_quality
+        return client.build_request(
+            "POST", edits_url, headers=headers, data=data,
+            files=[(image_field, item) for item in items],
+        )
 
     def request_once(size_text: str, client: httpx.Client) -> httpx.Response:
         if reference_paths:
-            image_field = "image" if model_id == GPT_IMAGE_2_VIP_MODEL_ID else "image[]"
-            files = [(image_field, item) for item in upload_items]
-            data = {
-                "model": model_id,
-                "prompt": prompt,
-            }
-            if size_text != "auto":
-                data["size"] = size_text
-            if send_quality:
-                data["quality"] = clean_quality
-            return client.post(
-                build_openai_url(api_base_url, "/images/edits"),
-                headers=headers,
-                data=data,
-                files=files,
-            )
+            return client.send(build_edit_request(client, size_text, upload_items))
         body: dict[str, Any] = {"model": model_id, "prompt": prompt, "n": 1}
         if size_text != "auto":
             body["size"] = size_text
@@ -1729,9 +1918,26 @@ def generate_openai_image(
             json=body,
         )
 
+    def prepare_uploads(client: httpx.Client) -> tuple[list[tuple[str, bytes, str]], str | None]:
+        return prepare_reference_uploads(
+            client, edits_url, headers, "multipart", list(reference_paths),
+            lambda items: request_body_size(build_edit_request(client, image_size, items)),
+        )
+
     with make_httpx_client(proxy_url) as client:
+        if reference_paths:
+            upload_items, upload_note = prepare_uploads(client)
         try:
-            payload = parse_json_response(request_once(image_size, client))
+            try:
+                payload = parse_json_response(request_once(image_size, client))
+            except httpx.HTTPError as exc:
+                # 缓存的上限可能已过时（中转站调整了配置）：记下这次被拒的大小，重新探测后再试一次。
+                if not (reference_paths and _is_body_rejection(exc)):
+                    raise
+                sent = request_body_size(build_edit_request(client, image_size, upload_items))
+                _save_body_limit(edits_url, rejected=sent)
+                upload_items, upload_note = prepare_uploads(client)
+                payload = parse_json_response(request_once(image_size, client))
         except Exception as exc:
             retry_size = fallback_openai_image_size(resolution, api_aspect_ratio, image_size)
             if not retry_size or not is_size_rejection(exc):
@@ -1774,34 +1980,41 @@ def generate_openai_chat_image(
     keep_alpha: bool = False,
 ) -> Image.Image:
     """调用常见中转站的 OpenAI Chat Completions 生图扩展。"""
-    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    if reference_paths:
-        upload_items, upload_note = shrink_reference_images(
-            list(reference_paths), REFERENCE_UPLOAD_BUDGET_BYTES_BASE64
-        )
-        if upload_note:
-            try:
-                gr.Info(upload_note)
-            except Exception:
-                pass
-        for _, data, mime_type in upload_items:
-            content.append({"type": "image_url", "image_url": {"url": bytes_to_data_url(data, mime_type)}})
-    body = {
-        "model": model_id,
-        "messages": [{"role": "user", "content": content}],
-        "modalities": ["text", "image"],
-        "stream": False,
-    }
+    chat_url = build_openai_url(api_base_url, "/chat/completions")
     headers = {
         "Authorization": f"Bearer {normalize_api_key(api_key)}",
         "Content-Type": "application/json",
     }
+
+    def build_body(items: list[tuple[str, bytes, str]]) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for _, data, mime_type in items:
+            content.append(
+                {"type": "image_url", "image_url": {"url": bytes_to_data_url(data, mime_type)}}
+            )
+        return {
+            "model": model_id,
+            "messages": [{"role": "user", "content": content}],
+            "modalities": ["text", "image"],
+            "stream": False,
+        }
+
     with make_httpx_client(proxy_url) as client:
-        response = client.post(
-            build_openai_url(api_base_url, "/chat/completions"),
-            headers=headers,
-            json=body,
-        )
+        upload_items: list[tuple[str, bytes, str]] = []
+        if reference_paths:
+            # Chat 协议把图片转成 base64 放进 JSON，体积约为原图的 4/3，按实际请求体大小计算。
+            upload_items, upload_note = prepare_reference_uploads(
+                client, chat_url, headers, "json", list(reference_paths),
+                lambda items: request_body_size(
+                    client.build_request("POST", chat_url, headers=headers, json=build_body(items))
+                ),
+            )
+            if upload_note:
+                try:
+                    gr.Info(upload_note)
+                except Exception:
+                    pass
+        response = client.post(chat_url, headers=headers, json=build_body(upload_items))
         return extract_openai_image(parse_json_response(response), client, keep_alpha=keep_alpha)
 
 
