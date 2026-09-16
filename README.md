@@ -64,6 +64,26 @@ Install_Shortcut.bat
 http://127.0.0.1:7860
 ```
 
+### macOS
+
+从 Release 下载 `.dmg`，拖进「应用程序」后**首次打开会被系统拦住**，提示：
+
+> 未打开“GeminiImageTool”。Apple 无法验证“GeminiImageTool”是否包含可能危害 Mac 安全或泄漏隐私的恶意软件。
+
+这是因为本项目的 App 没有经过 Apple 签名和公证（需要每年 99 美元的开发者账号），**不是安装包有问题**。注意此时不要点「移到废纸篓」。
+
+解除限制，在「终端」里执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/GeminiImageTool.app
+```
+
+执行后正常双击打开即可，这个操作只需做一次。若 App 放在别处，把路径换成实际位置。
+
+也可以不用命令行：先双击一次让它弹出上面的提示，点「完成」，然后打开**系统设置 → 隐私与安全性**，向下滚动找到「已阻止使用“GeminiImageTool”」，点**仍要打开**，再确认一次。
+
+> 每次下载新版本的 `.dmg` 都需要重新执行一次，因为隔离属性是下载时由系统附加的。
+
 ### 手动命令行启动
 
 ```powershell
