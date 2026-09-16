@@ -107,6 +107,10 @@ QUALITY_CHOICES = ["auto", "low", "medium", "high", "xhigh", "max"]
 # RollDek 文档：宽高须为 16 的倍数，比例 1:3～3:1，最大 3840x2160（按像素总量封顶）。
 MAX_IMAGE_PIXELS = 3840 * 2160
 MAX_IMAGE_SIDE = 3840
+# 实测 RollDek 的请求体上限约 8MB，超过时服务端直接断开连接（报 Server disconnected）。
+# 参考图总量留足余量；Chat 协议要 base64 编码（体积 ×4/3），预算再收紧。
+REFERENCE_UPLOAD_BUDGET_BYTES = 6 * 1024 * 1024
+REFERENCE_UPLOAD_BUDGET_BYTES_BASE64 = int(REFERENCE_UPLOAD_BUDGET_BYTES * 3 / 4)
 GPT_IMAGE_2_VIP_SIZES = {
     "1K": {
         "1:1": "1280x1280",
@@ -1566,6 +1570,93 @@ def extract_openai_image(
     return image.convert("RGBA") if keep_alpha and image.mode in ("RGBA", "LA", "P") else image.convert("RGB")
 
 
+def _encode_reference(image: Image.Image, keep_alpha: bool) -> tuple[bytes, str, str]:
+    """按是否含透明通道选择编码：透明用 PNG，不透明用高质量 JPEG。"""
+    buffer = BytesIO()
+    if keep_alpha:
+        image.convert("RGBA").save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue(), "image/png", ".png"
+    image.convert("RGB").save(buffer, format="JPEG", quality=92, optimize=True)
+    return buffer.getvalue(), "image/jpeg", ".jpg"
+
+
+def shrink_reference_images(
+    paths: list[str],
+    total_budget: int,
+) -> tuple[list[tuple[str, bytes, str]], str | None]:
+    """把参考图总大小压到预算以内，返回 [(文件名, 字节, MIME)] 和说明文字。
+
+    这里缩的是**输入参考图**，不影响输出分辨率；小于预算的图原样上传。
+    依次尝试：原尺寸重新编码 → 最长边 2048 → 1536 → 1280 → 1024 → 768。
+    """
+    items = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        items.append([path.name, path.read_bytes(), guess_mime_type(path)])
+    total = sum(len(data) for _, data, _ in items)
+    if total <= total_budget:
+        return [tuple(item) for item in items], None
+
+    # 已经足够小的图原样保留，剩余预算平分给大图。
+    fair_share = total_budget // len(items)
+    small_total = sum(len(data) for _, data, _ in items if len(data) <= fair_share)
+    large = [item for item in items if len(item[1]) > fair_share]
+    per_large_budget = max(1, (total_budget - small_total) // max(1, len(large)))
+
+    changed = []
+    for item in large:
+        name, data, _ = item
+        with Image.open(BytesIO(data)) as opened:
+            opened.load()
+            source = opened.copy()
+        keep_alpha = source.mode in ("RGBA", "LA") or (
+            source.mode == "P" and "transparency" in source.info
+        )
+        if keep_alpha:
+            # 名义上带透明通道、实际全不透明（截图、导出图常见）时改走 JPEG，保住分辨率。
+            alpha_min, _ = source.convert("RGBA").getchannel("A").getextrema()
+            keep_alpha = alpha_min < 255
+        original_size = source.size
+        longest = max(source.size)
+        encoded = None
+        for side in (longest, 2048, 1536, 1280, 1024, 768):
+            if side > longest:
+                continue
+            candidate = source if side == longest else resize_longest_side(source, side)
+            encoded = _encode_reference(candidate, keep_alpha)
+            if len(encoded[0]) <= per_large_budget:
+                break
+        new_bytes, new_mime, new_ext = encoded
+        item[0] = Path(name).stem + new_ext
+        item[1] = new_bytes
+        item[2] = new_mime
+        new_size = candidate.size
+        changed.append(
+            f"`{name}` {len(data) / 1048576:.1f}MB"
+            f"{f' {original_size[0]}x{original_size[1]}' if new_size != original_size else ''}"
+            f" → {len(new_bytes) / 1048576:.1f}MB"
+            f"{f' {new_size[0]}x{new_size[1]}' if new_size != original_size else ''}"
+        )
+
+    new_total = sum(len(data) for _, data, _ in items)
+    if new_total > total_budget:
+        raise RuntimeError(
+            f"参考图总大小 {new_total / 1048576:.1f}MB，压缩后仍超过上传上限 "
+            f"{total_budget / 1048576:.1f}MB。请减少参考图数量后重试。"
+        )
+    note = (
+        f"参考图总大小 {total / 1048576:.1f}MB 超过中转站请求上限，已自动压缩后上传："
+        + "；".join(changed)
+        + "。这只影响参考图，不影响出图分辨率。"
+    )
+    return [tuple(item) for item in items], note
+
+
+def bytes_to_data_url(data: bytes, mime_type: str) -> str:
+    """把图片字节转成 data URL。"""
+    return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
+
+
 def image_path_to_data_url(path: str) -> str:
     """把本地参考图转成 Chat Completions 可接受的 data URL。"""
     image_path = Path(path)
@@ -1603,16 +1694,16 @@ def generate_openai_image(
         and get_model_meta(model_id).get("supports_quality", True)
     )
 
+    upload_items, upload_note = (
+        shrink_reference_images(list(reference_paths), REFERENCE_UPLOAD_BUDGET_BYTES)
+        if reference_paths
+        else ([], None)
+    )
+
     def request_once(size_text: str, client: httpx.Client) -> httpx.Response:
         if reference_paths:
             image_field = "image" if model_id == GPT_IMAGE_2_VIP_MODEL_ID else "image[]"
-            files = [
-                (
-                    image_field,
-                    (Path(path).name, Path(path).read_bytes(), guess_mime_type(Path(path))),
-                )
-                for path in reference_paths
-            ]
+            files = [(image_field, item) for item in upload_items]
             data = {
                 "model": model_id,
                 "prompt": prompt,
@@ -1669,7 +1760,8 @@ def generate_openai_image(
             f"`{image.size[0]}x{image.size[1]}`，未达到 `{resolution}` 档位；"
             "已按真实像素保存，未做本地放大。"
         )
-    return image, mismatch
+    notes = [text for text in (upload_note, mismatch) if text]
+    return image, ("\n\n".join(notes) or None)
 
 
 def generate_openai_chat_image(
@@ -1683,8 +1775,17 @@ def generate_openai_chat_image(
 ) -> Image.Image:
     """调用常见中转站的 OpenAI Chat Completions 生图扩展。"""
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for path in reference_paths or []:
-        content.append({"type": "image_url", "image_url": {"url": image_path_to_data_url(path)}})
+    if reference_paths:
+        upload_items, upload_note = shrink_reference_images(
+            list(reference_paths), REFERENCE_UPLOAD_BUDGET_BYTES_BASE64
+        )
+        if upload_note:
+            try:
+                gr.Info(upload_note)
+            except Exception:
+                pass
+        for _, data, mime_type in upload_items:
+            content.append({"type": "image_url", "image_url": {"url": bytes_to_data_url(data, mime_type)}})
     body = {
         "model": model_id,
         "messages": [{"role": "user", "content": content}],
@@ -2098,6 +2199,15 @@ def map_error_message(exc: Exception) -> str:
         return (
             "连接 API 超时，当前更像是网络不通而不是 API Key 错误。"
             "如果你在国内网络环境，请配置可用代理，或在上方“设置”里填写 HTTP/SOCKS5 代理地址后重试。"
+        )
+    if (
+        "server disconnected" in normalized
+        or "connection reset" in normalized
+        or "remoteprotocolerror" in normalized
+    ):
+        return (
+            "服务端未返回任何响应就断开了连接。最常见的原因是请求体过大（如参考图太多或太大，"
+            "中转站通常限制在 8MB 左右），其次是中转站临时故障。请减少或缩小参考图后重试。"
         )
     if "timed out" in normalized or "timeout" in normalized:
         return "请求超时（5 分钟内未完成）。本次不会自动重试；请先核对服务商记录，避免重复扣费。"
