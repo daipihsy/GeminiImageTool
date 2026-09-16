@@ -102,6 +102,11 @@ GPT_IMAGE_2_VIP_MODEL_ID = "gpt-image-2-vip"
 AUTO_ASPECT_RATIO = "自适应"
 ASPECT_RATIO_CHOICES = [AUTO_ASPECT_RATIO, "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9", "4:1", "1:4"]
 RESOLUTION_CHOICES = ["512", "1K", "2K", "4K"]
+# RollDek 文档：quality 支持 low/medium/high/xhigh/max/auto，默认 auto。
+QUALITY_CHOICES = ["auto", "low", "medium", "high", "xhigh", "max"]
+# RollDek 文档：宽高须为 16 的倍数，比例 1:3～3:1，最大 3840x2160（按像素总量封顶）。
+MAX_IMAGE_PIXELS = 3840 * 2160
+MAX_IMAGE_SIDE = 3840
 GPT_IMAGE_2_VIP_SIZES = {
     "1K": {
         "1:1": "1280x1280",
@@ -196,6 +201,41 @@ MODEL_OPTIONS = [
         "supports_image_search": False,
         "api_kind": API_PROTOCOL_OPENAI_IMAGES,
     },
+    # 以下三个按 RollDek 官方文档登记能力（https://rolldek.com/docs/#/img25）。
+    # 登记它们是为了让界面能提前拦住不可能的组合，不影响手填任意模型 ID。
+    {
+        "label": "gpt-image-2.5（RollDek）— 仅 1K，不支持 quality",
+        "value": "gpt-image-2.5",
+        "short_name": "GPT-Image-2.5",
+        "native_sizes": {"1K"},
+        "native_aspects": set(GPT_IMAGE_2_VIP_SIZES["2K"].keys()),
+        "supports_google_search": False,
+        "supports_image_search": False,
+        "supports_quality": False,
+        "api_kind": API_PROTOCOL_OPENAI_IMAGES,
+    },
+    {
+        "label": "gpt-image-2.5-sunburst（RollDek）— 1K/2K/4K",
+        "value": "gpt-image-2.5-sunburst",
+        "short_name": "Sunburst",
+        "native_sizes": {"1K", "2K", "4K"},
+        "native_aspects": set(GPT_IMAGE_2_VIP_SIZES["2K"].keys()),
+        "supports_google_search": False,
+        "supports_image_search": False,
+        "supports_quality": True,
+        "api_kind": API_PROTOCOL_OPENAI_IMAGES,
+    },
+    {
+        "label": "gpt-image-2.5-flare（RollDek）— 1K/2K/4K",
+        "value": "gpt-image-2.5-flare",
+        "short_name": "Flare",
+        "native_sizes": {"1K", "2K", "4K"},
+        "native_aspects": set(GPT_IMAGE_2_VIP_SIZES["2K"].keys()),
+        "supports_google_search": False,
+        "supports_image_search": False,
+        "supports_quality": True,
+        "api_kind": API_PROTOCOL_OPENAI_IMAGES,
+    },
 ]
 MODEL_BY_ID = {item["value"]: item for item in MODEL_OPTIONS}
 MODEL_LABELS = {item["value"]: item["label"] for item in MODEL_OPTIONS}
@@ -230,6 +270,7 @@ def get_model_meta(model_id: str) -> dict[str, Any]:
         "native_aspects": {"1:1", "4:3", "3:4", "16:9", "9:16"},
         "supports_google_search": looks_gemini,
         "supports_image_search": False,
+        "supports_quality": True,
         "api_kind": "auto",
     }
 
@@ -252,6 +293,10 @@ MODEL_FALLBACK_ASPECTS = {
         "4:5": "3:4",
         "5:4": "4:3",
     },
+    # 4:1 / 1:4 超出 RollDek 允许的 1:3～3:1，必须先映射到合规比例再本地裁切。
+    "gpt-image-2.5": {"4:1": "21:9", "1:4": "9:16"},
+    "gpt-image-2.5-sunburst": {"4:1": "21:9", "1:4": "9:16"},
+    "gpt-image-2.5-flare": {"4:1": "21:9", "1:4": "9:16"},
 }
 LONGEST_SIDE_BY_RESOLUTION = {
     "512": 512,
@@ -264,6 +309,7 @@ DEFAULT_PARAMS = {
     "aspect_ratio": "1:1",
     "resolution": "1K",
     "image_count": 1,
+    "quality": "auto",
     "keep_seed": False,
     "seed": None,
     "enable_google_search": False,
@@ -1314,23 +1360,106 @@ def make_httpx_client(proxy_url: str = "") -> httpx.Client:
     return httpx.Client(**kwargs)
 
 
-def resolve_openai_image_size(
-    model_id: str,
-    resolution: str,
-    api_aspect_ratio: str | None,
-) -> str:
-    """把界面比例转换为 OpenAI Images 常见 size；VIP 模型保留其扩展尺寸。"""
+def compute_size_for_resolution(resolution: str, api_aspect_ratio: str | None) -> str | None:
+    """按档位最长边和宽高比算出请求尺寸，边长对齐到 16 的倍数。"""
     if not api_aspect_ratio:
-        return "auto"
-    if model_id == GPT_IMAGE_2_VIP_MODEL_ID:
-        return GPT_IMAGE_2_VIP_SIZES.get(resolution, {}).get(api_aspect_ratio, "auto")
+        return None
+    longest = LONGEST_SIDE_BY_RESOLUTION.get(resolution)
+    if not longest:
+        return None
     try:
-        width, height = (float(part) for part in api_aspect_ratio.split(":", 1))
+        w_ratio, h_ratio = (float(part) for part in api_aspect_ratio.split(":", 1))
+    except (TypeError, ValueError):
+        return None
+    if w_ratio <= 0 or h_ratio <= 0:
+        return None
+    if w_ratio >= h_ratio:
+        width, height = float(longest), longest * h_ratio / w_ratio
+    else:
+        width, height = longest * w_ratio / h_ratio, float(longest)
+
+    # 超过像素预算（4K 档常见）时整体等比缩到预算内；单边也不得超过上限。
+    if width * height > MAX_IMAGE_PIXELS:
+        scale = (MAX_IMAGE_PIXELS / (width * height)) ** 0.5
+        width, height = width * scale, height * scale
+    if max(width, height) > MAX_IMAGE_SIDE:
+        scale = MAX_IMAGE_SIDE / max(width, height)
+        width, height = width * scale, height * scale
+
+    # 向下对齐到 16 的倍数，避免四舍五入后重新超出预算。
+    align = lambda value: max(16, int(value // 16) * 16)
+    return f"{align(width)}x{align(height)}"
+
+
+def official_openai_size(api_aspect_ratio: str | None) -> str:
+    """OpenAI Images 官方接受的三种尺寸，按比例取最接近的一种。"""
+    try:
+        width, height = (float(part) for part in (api_aspect_ratio or "").split(":", 1))
     except (TypeError, ValueError):
         return "auto"
     if abs(width - height) < 0.01:
         return "1024x1024"
     return "1536x1024" if width > height else "1024x1536"
+
+
+def resolve_openai_image_size(
+    model_id: str,
+    resolution: str,
+    api_aspect_ratio: str | None,
+) -> str:
+    """把界面档位+比例换算成 OpenAI Images 的 size。
+
+    不再按模型 ID 白名单判断：中转站检测到的模型名千奇百怪，写死 ID 会让
+    分辨率参数被整个丢掉。规则改为——
+    1K 用公式算（1024 系，官方端点也接受）；
+    2K/4K 优先用已知可用的扩展尺寸表，表里没有的比例再用公式算。
+    """
+    del model_id  # 保留形参以兼容调用方，尺寸不再由模型名决定。
+    if not api_aspect_ratio:
+        return "auto"
+    if resolution in {"2K", "4K"}:
+        table_size = GPT_IMAGE_2_VIP_SIZES.get(resolution, {}).get(api_aspect_ratio)
+        if table_size:
+            return table_size
+        computed = compute_size_for_resolution(resolution, api_aspect_ratio)
+        if computed:
+            return computed
+    # 512 / 1K 档沿用 OpenAI 官方接受的三种尺寸，避免官方端点因非常规 size 直接报错；
+    # 非原生比例由既有的本地裁切处理（裁切是丢像素，不是插值造像素）。
+    return official_openai_size(api_aspect_ratio)
+
+
+def fallback_openai_image_size(resolution: str, api_aspect_ratio: str | None, tried: str) -> str | None:
+    """首选尺寸被服务端拒绝时，换另一个同档位的真实尺寸重试（绝不降级放大）。"""
+    if not api_aspect_ratio:
+        return None
+    if resolution not in {"2K", "4K"}:
+        return None  # 低档位首选已是官方尺寸，没有更保险的同档位备选。
+    candidates = [
+        GPT_IMAGE_2_VIP_SIZES.get(resolution, {}).get(api_aspect_ratio),
+        compute_size_for_resolution(resolution, api_aspect_ratio),
+    ]
+    for candidate in candidates:
+        if candidate and candidate != tried:
+            return candidate
+    return None
+
+
+def size_to_longest_side(size_text: str) -> int | None:
+    """把 `2048x1152` 解析成最长边像素。"""
+    match = re.fullmatch(r"(\d+)x(\d+)", (size_text or "").strip())
+    return max(int(match.group(1)), int(match.group(2))) if match else None
+
+
+def is_size_rejection(exc: Exception) -> bool:
+    """判断一个 API 错误是不是因为 size 参数不被接受。"""
+    text = str(exc).lower()
+    if not any(word in text for word in ("size", "dimension", "resolution", "尺寸", "分辨率")):
+        return False
+    return any(
+        word in text
+        for word in ("invalid", "unsupported", "not support", "must be", "allowed", "不支持", "无效")
+    )
 
 
 def extract_error_detail(payload: Any) -> str:
@@ -1454,12 +1583,27 @@ def generate_openai_image(
     resolution: str,
     api_aspect_ratio: str | None,
     keep_alpha: bool = False,
-) -> Image.Image:
-    """调用标准 OpenAI Images/Edits 兼容端点生成图片。"""
+    quality: str = "auto",
+) -> tuple[Image.Image, str | None]:
+    """调用标准 OpenAI Images/Edits 兼容端点生成图片。
+
+    返回 (图片, 尺寸不符说明)。第二项非空表示服务端返回的像素低于请求值，
+    调用方应如实展示，而不是本地放大掩盖。
+
+    首选尺寸被服务端以 size 相关的错误拒绝时，改用同档位的另一个真实尺寸重试一次。
+    两次都不行就直接抛错——绝不退回小尺寸再本地放大冒充高分辨率。
+    """
     image_size = resolve_openai_image_size(model_id, resolution, api_aspect_ratio)
     headers = {"Authorization": f"Bearer {normalize_api_key(api_key)}"}
+    # quality 只在用户显式选了非 auto、且该模型没被登记为不支持时才发送。
+    # RollDek 文档明确要求 gpt-image-2.5 省略此字段。
+    clean_quality = (quality or "auto").strip().lower()
+    send_quality = (
+        clean_quality not in {"", "auto"}
+        and get_model_meta(model_id).get("supports_quality", True)
+    )
 
-    with make_httpx_client(proxy_url) as client:
+    def request_once(size_text: str, client: httpx.Client) -> httpx.Response:
         if reference_paths:
             image_field = "image" if model_id == GPT_IMAGE_2_VIP_MODEL_ID else "image[]"
             files = [
@@ -1473,25 +1617,59 @@ def generate_openai_image(
                 "model": model_id,
                 "prompt": prompt,
             }
-            if image_size != "auto":
-                data["size"] = image_size
-            response = client.post(
+            if size_text != "auto":
+                data["size"] = size_text
+            if send_quality:
+                data["quality"] = clean_quality
+            return client.post(
                 build_openai_url(api_base_url, "/images/edits"),
                 headers=headers,
                 data=data,
                 files=files,
             )
-        else:
-            body: dict[str, Any] = {"model": model_id, "prompt": prompt, "n": 1}
-            if image_size != "auto":
-                body["size"] = image_size
-            response = client.post(
-                build_openai_url(api_base_url, "/images/generations"),
-                headers={**headers, "Content-Type": "application/json"},
-                json=body,
-            )
+        body: dict[str, Any] = {"model": model_id, "prompt": prompt, "n": 1}
+        if size_text != "auto":
+            body["size"] = size_text
+        if send_quality:
+            body["quality"] = clean_quality
+        return client.post(
+            build_openai_url(api_base_url, "/images/generations"),
+            headers={**headers, "Content-Type": "application/json"},
+            json=body,
+        )
 
-        return extract_openai_image(parse_json_response(response), client, keep_alpha=keep_alpha)
+    with make_httpx_client(proxy_url) as client:
+        try:
+            payload = parse_json_response(request_once(image_size, client))
+        except Exception as exc:
+            retry_size = fallback_openai_image_size(resolution, api_aspect_ratio, image_size)
+            if not retry_size or not is_size_rejection(exc):
+                raise
+            try:
+                payload = parse_json_response(request_once(retry_size, client))
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    f"该模型不接受 {resolution} 档位的原生尺寸："
+                    f"`{image_size}` 和 `{retry_size}` 均被拒绝。"
+                    f"请改用更低的分辨率档位或换一个模型。原始错误：{retry_exc}"
+                ) from retry_exc
+            image_size = retry_size
+
+        image = extract_openai_image(payload, client, keep_alpha=keep_alpha)
+
+    requested_longest = size_to_longest_side(image_size)
+    actual_longest = max(image.size)
+    mismatch = None
+    if requested_longest and actual_longest < requested_longest:
+        # RollDek 等会在响应里回显实际使用的 size / quality，比量像素更权威。
+        echoed = payload.get("size") if isinstance(payload, dict) else None
+        echo_note = f"（服务端回报 size=`{echoed}`）" if echoed else ""
+        mismatch = (
+            f"请求 `{image_size}`{echo_note}，实际只返回 "
+            f"`{image.size[0]}x{image.size[1]}`，未达到 `{resolution}` 档位；"
+            "已按真实像素保存，未做本地放大。"
+        )
+    return image, mismatch
 
 
 def generate_openai_chat_image(
@@ -1651,11 +1829,12 @@ def resolve_protocol_aspect_ratio(
         return None, False
     if protocol == API_PROTOCOL_OPENAI_CHAT:
         return None, True
-    if model_id == GPT_IMAGE_2_VIP_MODEL_ID:
+    # 已登记能力的模型（VIP、RollDek 系列）直接按其原生比例表判断，避免无谓的本地裁切。
+    if model_id in MODEL_BY_ID:
         if aspect_ratio in get_model_meta(model_id)["native_aspects"]:
             return aspect_ratio, False
         return None, True
-    # 标准 OpenAI Images 常见原生尺寸只有方形、2:3 和 3:2；其它比例生成后精确裁切。
+    # 未登记的模型保守处理：标准 OpenAI Images 原生尺寸只有方形、2:3 和 3:2，其它比例生成后精确裁切。
     return aspect_ratio, aspect_ratio not in {"1:1", "2:3", "3:2"}
 
 
@@ -1685,11 +1864,21 @@ def crop_to_ratio(image: Image.Image, target_ratio: str) -> Image.Image:
     return image.crop((0, top, current_w, top + new_height))
 
 
-def resize_longest_side(image: Image.Image, longest_side: int) -> Image.Image:
-    """把图片缩放到指定最长边。"""
+def resize_longest_side(
+    image: Image.Image,
+    longest_side: int,
+    allow_upscale: bool = False,
+) -> Image.Image:
+    """把图片缩放到指定最长边。
+
+    allow_upscale 默认关闭：生成链路里只允许降采样。向上插值出来的“2K”
+    是假的原生分辨率，宁可保留真实的小图并在结果区如实说明。
+    """
     width, height = image.size
     current_longest = max(width, height)
     if current_longest == longest_side:
+        return image
+    if current_longest < longest_side and not allow_upscale:
         return image
     scale = longest_side / current_longest
     return image.resize(
@@ -2516,7 +2705,10 @@ def build_status_message(
     elif requested_aspect not in model_meta.get("native_aspects", set()):
         lines.append(f"说明：`{requested_aspect}` 不是该模型原生比例，程序已在本地做中心裁切。")
     if requested_resolution not in model_meta.get("native_sizes", set()):
-        lines.append(f"说明：`{requested_resolution}` 不是该模型原生尺寸，程序已在本地做缩放处理。")
+        lines.append(
+            f"说明：`{requested_resolution}` 不是该模型原生尺寸；"
+            "程序只会向下缩小，不会向上插值放大。"
+        )
 
     lines.extend(grounding_notes)
     if grounding_markdown:
@@ -3277,6 +3469,7 @@ def generate_handler(
     reference_image_paths: list[str] | None,
     aspect_ratio: str,
     resolution: str,
+    quality: str,
     image_count: int,
     keep_seed: bool,
     seed_value: float | int | None,
@@ -3374,6 +3567,23 @@ def generate_handler(
     stored_gallery_items: list[dict[str, str]] = []
     per_image_seeds: list[int] = []
     grounding_info: dict[str, Any] = {"web_search_queries": [], "image_search_queries": [], "sources": []}
+    resolution_notes: list[str] = []
+    if protocol == API_PROTOCOL_OPENAI_CHAT and resolution not in {"512", "1K"}:
+        resolution_notes.append(
+            f"⚠️ 当前协议是 `Chat 生图（/v1/chat/completions）`，该接口不接受 size 参数，"
+            f"`{resolution}` 不会生效，出图必定是默认 1K。"
+            "要出高分辨率请把接口协议切换到 `OpenAI Images（/v1/images）`。"
+        )
+    if (
+        protocol == API_PROTOCOL_OPENAI_IMAGES
+        and aspect_ratio == AUTO_ASPECT_RATIO
+        and resolution not in {"512", "1K"}
+    ):
+        resolution_notes.append(
+            f"注意：`自适应` 比例下无法向 OpenAI 兼容接口指定尺寸，"
+            f"本次不会发送 size 参数，实际出图很可能达不到 `{resolution}`。"
+            "需要确定的高分辨率请选一个具体宽高比。"
+        )
     total_start = perf_counter()
     last_error: str | None = None
 
@@ -3409,7 +3619,7 @@ def generate_handler(
         _recv_thread.start()
         try:
             if protocol == API_PROTOCOL_OPENAI_IMAGES:
-                image = generate_openai_image(
+                image, size_mismatch_note = generate_openai_image(
                     api_key=api_key,
                     proxy_url=proxy_url,
                     api_base_url=api_base_url,
@@ -3418,7 +3628,10 @@ def generate_handler(
                     reference_paths=reference_paths,
                     resolution=resolution,
                     api_aspect_ratio=api_aspect_ratio,
+                    quality=quality,
                 )
+                if size_mismatch_note and size_mismatch_note not in resolution_notes:
+                    resolution_notes.append(size_mismatch_note)
             elif protocol == API_PROTOCOL_OPENAI_CHAT:
                 image = generate_openai_chat_image(
                     api_key=api_key,
@@ -3541,7 +3754,7 @@ def generate_handler(
         used_model_id=model_id,
         grounding_summary=grounding_summary,
         grounding_markdown=grounding_markdown,
-        grounding_notes=grounding_notes,
+        grounding_notes=[*resolution_notes, *grounding_notes],
         conversation=conversation,
         output_root=output_root_path,
         backup_root=backup_root_path,
@@ -3587,17 +3800,23 @@ def generate_or_unlock_batch_handler(
     conversations_state: list[dict[str, Any]],
     prompt: str,
     model_id: str,
+    manual_model_id: str,
     enable_google_search: bool,
     enable_image_search: bool,
     reference_image_paths: list[str] | None,
     aspect_ratio: str,
     resolution: str,
+    quality: str,
     image_count: int,
     keep_seed: bool,
     seed_value: float | int | None,
     progress: gr.Progress = gr.Progress(track_tqdm=False),
 ) -> tuple[Any, ...]:
     """生成按钮入口：暗门指令只解锁批量生图，不调用 API。"""
+    # 手填 ID 优先：中转站的 /v1/models 常常列不全，下拉框里选不到的模型走这里。
+    override = (manual_model_id or "").strip()
+    if override:
+        model_id = override
     if is_batch_gate_prompt(prompt):
         gr.Info("批量生图已解锁。")
         noop_result = build_generate_noop_result(
@@ -3636,6 +3855,7 @@ def generate_or_unlock_batch_handler(
         reference_image_paths,
         aspect_ratio,
         resolution,
+        quality,
         image_count,
         keep_seed,
         seed_value,
@@ -4158,7 +4378,7 @@ def batch_generate_handler(
             request_start = perf_counter()
             try:
                 if protocol == API_PROTOCOL_OPENAI_IMAGES:
-                    image = generate_openai_image(
+                    image, size_mismatch_note = generate_openai_image(
                         api_key=api_key,
                         proxy_url=proxy_url,
                         api_base_url=api_base_url,
@@ -4168,6 +4388,8 @@ def batch_generate_handler(
                         resolution=task["resolution"],
                         api_aspect_ratio=api_aspect_ratio,
                     )
+                    if size_mismatch_note:
+                        gr.Warning(f"第 {prompt_index} 行：{size_mismatch_note}")
                 elif protocol == API_PROTOCOL_OPENAI_CHAT:
                     image = generate_openai_chat_image(
                         api_key=api_key,
@@ -4417,7 +4639,7 @@ def run_protocol_image_edit(
     """按当前协议执行图片编辑；OpenAI Images 使用 edits，Chat 使用多模态消息。"""
     protocol = normalize_api_protocol(api_protocol)
     if protocol == API_PROTOCOL_OPENAI_IMAGES:
-        return generate_openai_image(
+        edited_image, _ = generate_openai_image(
             api_key=api_key,
             proxy_url=proxy_url,
             api_base_url=api_base_url,
@@ -4428,6 +4650,7 @@ def run_protocol_image_edit(
             api_aspect_ratio=None,
             keep_alpha=keep_alpha,
         )
+        return edited_image
     if protocol == API_PROTOCOL_OPENAI_CHAT:
         return generate_openai_chat_image(
             api_key=api_key,
@@ -4998,10 +5221,21 @@ def build_demo() -> gr.Blocks:
                                 value=initial_creative_model_value,
                                 allow_custom_value=True,
                             )
+                            manual_model_box = gr.Textbox(
+                                label="手动模型 ID（可选）",
+                                placeholder="下拉框里没有的模型，在这里直接填完整 ID",
+                                value="",
+                                max_lines=1,
+                            )
                             aspect_ratio_dropdown = gr.Dropdown(
                                 label="宽高比",
                                 choices=ASPECT_RATIO_CHOICES,
                                 value=initial_view[9],
+                            )
+                            quality_dropdown = gr.Dropdown(
+                                label="质量（quality）",
+                                choices=QUALITY_CHOICES,
+                                value=DEFAULT_PARAMS["quality"],
                             )
                             resolution_dropdown = gr.Dropdown(
                                 label="分辨率",
@@ -5848,11 +6082,13 @@ def build_demo() -> gr.Blocks:
                 conversations_state,
                 prompt_box,
                 model_dropdown,
+                manual_model_box,
                 google_search_checkbox,
                 image_search_checkbox,
                 reference_image_paths_state,
                 aspect_ratio_dropdown,
                 resolution_dropdown,
+                quality_dropdown,
                 image_count_slider,
                 keep_seed_checkbox,
                 seed_number,
