@@ -27,8 +27,6 @@ on:
 permissions:
   contents: write
 
-env:
-
 jobs:
   windows:
     runs-on: windows-latest
