@@ -83,7 +83,8 @@ MAX_REFERENCE_IMAGES = 10
 MAX_GENERATE_IMAGES = 10
 INITIAL_BATCH_ROWS = 10
 MAX_BATCH_ROWS = 30
-MAX_BATCH_ROW_INPUT_SIZE = 10
+# 每行任务的输入字段数，必须与界面 batch_row_inputs 的顺序、collect_batch_tasks 的解包一致。
+MAX_BATCH_ROW_INPUT_SIZE = 12
 MAX_BATCH_TOTAL_IMAGES = MAX_BATCH_ROWS * MAX_GENERATE_IMAGES
 MAX_REFERENCE_BYTES = 20 * 1024 * 1024
 TEST_MODEL_ID = "gemini-2.5-flash-lite"
@@ -1414,6 +1415,26 @@ def official_openai_size(api_aspect_ratio: str | None) -> str:
     if abs(width - height) < 0.01:
         return "1024x1024"
     return "1536x1024" if width > height else "1024x1536"
+
+
+def build_resolution_warnings(protocol: str, aspect_ratio: str, resolution: str) -> list[str]:
+    """生成前就能确定“高分辨率不会生效”的情况，创作页和批量页共用。"""
+    warnings: list[str] = []
+    if resolution in {"512", "1K"}:
+        return warnings
+    if protocol == API_PROTOCOL_OPENAI_CHAT:
+        warnings.append(
+            f"⚠️ 当前协议是 `Chat 生图（/v1/chat/completions）`，该接口不接受 size 参数，"
+            f"`{resolution}` 不会生效，出图必定是默认 1K。"
+            "要出高分辨率请把接口协议切换到 `OpenAI Images（/v1/images）`。"
+        )
+    elif protocol == API_PROTOCOL_OPENAI_IMAGES and aspect_ratio == AUTO_ASPECT_RATIO:
+        warnings.append(
+            f"注意：`自适应` 比例下无法向 OpenAI 兼容接口指定尺寸，"
+            f"本次不会发送 size 参数，实际出图很可能达不到 `{resolution}`。"
+            "需要确定的高分辨率请选一个具体宽高比。"
+        )
+    return warnings
 
 
 def resolve_openai_image_size(
@@ -3890,23 +3911,7 @@ def generate_handler(
     stored_gallery_items: list[dict[str, str]] = []
     per_image_seeds: list[int] = []
     grounding_info: dict[str, Any] = {"web_search_queries": [], "image_search_queries": [], "sources": []}
-    resolution_notes: list[str] = []
-    if protocol == API_PROTOCOL_OPENAI_CHAT and resolution not in {"512", "1K"}:
-        resolution_notes.append(
-            f"⚠️ 当前协议是 `Chat 生图（/v1/chat/completions）`，该接口不接受 size 参数，"
-            f"`{resolution}` 不会生效，出图必定是默认 1K。"
-            "要出高分辨率请把接口协议切换到 `OpenAI Images（/v1/images）`。"
-        )
-    if (
-        protocol == API_PROTOCOL_OPENAI_IMAGES
-        and aspect_ratio == AUTO_ASPECT_RATIO
-        and resolution not in {"512", "1K"}
-    ):
-        resolution_notes.append(
-            f"注意：`自适应` 比例下无法向 OpenAI 兼容接口指定尺寸，"
-            f"本次不会发送 size 参数，实际出图很可能达不到 `{resolution}`。"
-            "需要确定的高分辨率请选一个具体宽高比。"
-        )
+    resolution_notes: list[str] = build_resolution_warnings(protocol, aspect_ratio, resolution)
     total_start = perf_counter()
     last_error: str | None = None
 
@@ -4316,14 +4321,18 @@ def collect_batch_tasks(
             reference_value,
             prompt_value,
             model_id,
+            manual_model_id,
             enable_google_search,
             enable_image_search,
             aspect_ratio,
             resolution,
+            quality,
             images_per_prompt,
             keep_seed,
             seed_value,
         ) = row_values[offset : offset + MAX_BATCH_ROW_INPUT_SIZE]
+        # 手填 ID 优先，与创作页一致。
+        model_id = (manual_model_id or "").strip() or model_id
 
         reference_paths = normalize_uploaded_reference_paths(reference_value)
         clean_prompt = (prompt_value or "").strip()
@@ -4352,6 +4361,7 @@ def collect_batch_tasks(
             "enable_image_search": bool(enable_image_search),
             "aspect_ratio": aspect_ratio or DEFAULT_PARAMS["aspect_ratio"],
             "resolution": resolution or DEFAULT_PARAMS["resolution"],
+            "quality": quality or DEFAULT_PARAMS["quality"],
             "images_per_prompt": clamp_positive_int(images_per_prompt, 1, MAX_GENERATE_IMAGES),
             "keep_seed": bool(keep_seed),
             "seed_value": seed_value,
@@ -4383,6 +4393,8 @@ def build_batch_task_rows(tasks: list[dict[str, Any]], status: str) -> list[list
         if task["enable_image_search"]:
             grounding.append("Image")
         note = f"{model_label} · {task['aspect_ratio']} · {task['resolution']}"
+        if task.get("quality", "auto") != "auto":
+            note = f"{note} · quality={task['quality']}"
         if grounding:
             note = f"{note} · {'+'.join(grounding)}"
         if task["global_prompt_suffix"]:
@@ -4424,15 +4436,18 @@ def preview_batch_tasks_handler(
 
 def apply_batch_defaults_handler(
     model_id: str,
+    manual_model_id: str,
     enable_google_search: bool,
     enable_image_search: bool,
     aspect_ratio: str,
     resolution: str,
+    quality: str,
     images_per_prompt: int,
 ) -> tuple[Any, ...]:
     """把顶部默认参数一次性同步到全部任务行。"""
+    clean_manual = (manual_model_id or "").strip()
     image_search_update, grounding_hint = refresh_grounding_controls(
-        model_id, enable_google_search, enable_image_search
+        clean_manual or model_id, enable_google_search, enable_image_search
     )
     safe_count = clamp_positive_int(images_per_prompt, 1, MAX_GENERATE_IMAGES)
     updates: list[Any] = []
@@ -4440,10 +4455,12 @@ def apply_batch_defaults_handler(
         updates.extend(
             [
                 gr.update(value=model_id),
+                gr.update(value=clean_manual),
                 gr.update(value=bool(enable_google_search)),
                 image_search_update,
                 gr.update(value=aspect_ratio),
                 gr.update(value=resolution),
+                gr.update(value=quality or DEFAULT_PARAMS["quality"]),
                 gr.update(value=safe_count),
                 grounding_hint,
             ]
@@ -4464,10 +4481,12 @@ def clear_batch_table_handler(api_protocol: str) -> tuple[Any, ...]:
                 build_batch_reference_hint([]),
                 gr.update(value=""),
                 gr.update(value=default_model),
+                gr.update(value=""),
                 gr.update(value=False),
                 gr.update(value=False, interactive=False),
                 gr.update(value=DEFAULT_PARAMS["aspect_ratio"]),
                 gr.update(value=DEFAULT_PARAMS["resolution"]),
+                gr.update(value=DEFAULT_PARAMS["quality"]),
                 gr.update(value=1),
                 gr.update(value=False),
                 gr.update(value=None, interactive=False),
@@ -4644,6 +4663,11 @@ def batch_generate_handler(
         prompt_success_count = 0
         last_error = ""
         grounding_notes: list[str] = []
+        # 分辨率相关提示（协议不支持、自适应比例、参考图压缩、返回尺寸不符）统一写进本行“说明”，
+        # 不再每张图弹一次窗。
+        row_notes: list[str] = build_resolution_warnings(
+            protocol, task["aspect_ratio"], task["resolution"]
+        )
         grounding_summary = "关闭"
         try:
             base_seed, _seed_locked = ensure_seed(task["keep_seed"], task["seed_value"])
@@ -4710,9 +4734,10 @@ def batch_generate_handler(
                         reference_paths=task["reference_paths"],
                         resolution=task["resolution"],
                         api_aspect_ratio=api_aspect_ratio,
+                        quality=task["quality"],
                     )
-                    if size_mismatch_note:
-                        gr.Warning(f"第 {prompt_index} 行：{size_mismatch_note}")
+                    if size_mismatch_note and size_mismatch_note not in row_notes:
+                        row_notes.append(size_mismatch_note)
                 elif protocol == API_PROTOCOL_OPENAI_CHAT:
                     image = generate_openai_chat_image(
                         api_key=api_key,
@@ -4805,12 +4830,13 @@ def batch_generate_handler(
         note_parts = []
         if task["prompt_source"] != "用户输入":
             note_parts.append("Prompt 使用默认图生图提示")
+        note_parts.extend(row_notes)
         if grounding_notes:
             note_parts.extend(grounding_notes)
         if note_parts and not rows[row_position][5]:
             rows[row_position][5] = "；".join(note_parts)
-        elif last_error and grounding_notes:
-            rows[row_position][5] = f"{last_error}；" + "；".join(grounding_notes)
+        elif last_error and (grounding_notes or row_notes):
+            rows[row_position][5] = f"{last_error}；" + "；".join([*row_notes, *grounding_notes])
 
         prompt_history_update = gr.update()
         if prompt_success_count > 0:
@@ -5856,11 +5882,22 @@ def build_demo() -> gr.Blocks:
                                 value=initial_edit_model_value,
                                 allow_custom_value=True,
                             )
+                            batch_default_manual_model_box = gr.Textbox(
+                                label="默认手动模型 ID（可选）",
+                                placeholder="下拉框里没有的模型，在这里直接填完整 ID",
+                                value="",
+                                max_lines=1,
+                            )
                             with gr.Row():
                                 batch_default_aspect_ratio_dropdown = gr.Dropdown(
                                     label="默认宽高比",
                                     choices=ASPECT_RATIO_CHOICES,
                                     value=DEFAULT_PARAMS["aspect_ratio"],
+                                )
+                                batch_default_quality_dropdown = gr.Dropdown(
+                                    label="默认质量（quality）",
+                                    choices=QUALITY_CHOICES,
+                                    value=DEFAULT_PARAMS["quality"],
                                 )
                                 batch_default_resolution_dropdown = gr.Dropdown(
                                     label="默认分辨率",
@@ -5953,11 +5990,22 @@ def build_demo() -> gr.Blocks:
                                         allow_custom_value=True,
                                     )
                                     batch_row_model_dropdowns.append(row_model_dropdown)
+                                    row_manual_model_box = gr.Textbox(
+                                        label="手动模型 ID（可选）",
+                                        placeholder="填了就优先用这个",
+                                        value="",
+                                        max_lines=1,
+                                    )
                                     with gr.Row():
                                         row_aspect_ratio_dropdown = gr.Dropdown(
                                             label="宽高比",
                                             choices=ASPECT_RATIO_CHOICES,
                                             value=DEFAULT_PARAMS["aspect_ratio"],
+                                        )
+                                        row_quality_dropdown = gr.Dropdown(
+                                            label="质量",
+                                            choices=QUALITY_CHOICES,
+                                            value=DEFAULT_PARAMS["quality"],
                                         )
                                         row_resolution_dropdown = gr.Dropdown(
                                             label="分辨率",
@@ -5999,10 +6047,12 @@ def build_demo() -> gr.Blocks:
                                     row_reference_paths_state,
                                     row_prompt_box,
                                     row_model_dropdown,
+                                    row_manual_model_box,
                                     row_google_search_checkbox,
                                     row_image_search_checkbox,
                                     row_aspect_ratio_dropdown,
                                     row_resolution_dropdown,
+                                    row_quality_dropdown,
                                     row_images_per_prompt_slider,
                                     row_keep_seed_checkbox,
                                     row_seed_number,
@@ -6016,10 +6066,12 @@ def build_demo() -> gr.Blocks:
                                     row_reference_hint,
                                     row_prompt_box,
                                     row_model_dropdown,
+                                    row_manual_model_box,
                                     row_google_search_checkbox,
                                     row_image_search_checkbox,
                                     row_aspect_ratio_dropdown,
                                     row_resolution_dropdown,
+                                    row_quality_dropdown,
                                     row_images_per_prompt_slider,
                                     row_keep_seed_checkbox,
                                     row_seed_number,
@@ -6028,10 +6080,12 @@ def build_demo() -> gr.Blocks:
                             batch_row_default_outputs.extend(
                                 [
                                     row_model_dropdown,
+                                    row_manual_model_box,
                                     row_google_search_checkbox,
                                     row_image_search_checkbox,
                                     row_aspect_ratio_dropdown,
                                     row_resolution_dropdown,
+                                    row_quality_dropdown,
                                     row_images_per_prompt_slider,
                                     row_grounding_hint,
                                 ]
@@ -6229,10 +6283,12 @@ def build_demo() -> gr.Blocks:
             fn=apply_batch_defaults_handler,
             inputs=[
                 batch_default_model_dropdown,
+                batch_default_manual_model_box,
                 batch_default_google_search_checkbox,
                 batch_default_image_search_checkbox,
                 batch_default_aspect_ratio_dropdown,
                 batch_default_resolution_dropdown,
+                batch_default_quality_dropdown,
                 batch_default_images_per_prompt_slider,
             ],
             outputs=batch_row_default_outputs,

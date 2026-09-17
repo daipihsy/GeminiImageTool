@@ -27,7 +27,6 @@ permissions:
   contents: write
 
 env:
-  DESKTOP_BETA_RELEASE_TAG: v2.3.0-beta.1
 
 jobs:
   build-macos:
@@ -54,15 +53,20 @@ jobs:
         env:
           REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
+          # 只有推送 v* tag 或手动指定 tag 时才上传到 Release；
+          # 推 main / PR 只构建开发版安装包，作为 artifact 保留，不碰任何 Release。
           TAG="$REQUESTED_RELEASE_TAG"
+          PUBLISH=true
           if [ -z "$TAG" ]; then
             if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
               TAG="$GITHUB_REF_NAME"
             else
-              TAG="$DESKTOP_BETA_RELEASE_TAG"
+              TAG="v0.0.0-dev.${GITHUB_SHA::7}"
+              PUBLISH=false
             fi
           fi
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "PUBLISH_RELEASE=$PUBLISH" >> "$GITHUB_ENV"
 
       - name: Build macOS app icon
         run: |
@@ -120,7 +124,7 @@ jobs:
           ls -lh *.dmg
 
       - name: Upload .dmg to Release
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && env.PUBLISH_RELEASE == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
