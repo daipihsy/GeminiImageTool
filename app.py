@@ -4128,7 +4128,6 @@ def generate_or_unlock_batch_handler(
     conversations_state: list[dict[str, Any]],
     prompt: str,
     model_id: str,
-    manual_model_id: str,
     enable_google_search: bool,
     enable_image_search: bool,
     reference_image_paths: list[str] | None,
@@ -4141,10 +4140,6 @@ def generate_or_unlock_batch_handler(
     progress: gr.Progress = gr.Progress(track_tqdm=False),
 ) -> tuple[Any, ...]:
     """生成按钮入口：暗门指令只解锁批量生图，不调用 API。"""
-    # 手填 ID 优先：中转站的 /v1/models 常常列不全，下拉框里选不到的模型走这里。
-    override = (manual_model_id or "").strip()
-    if override:
-        model_id = override
     if is_batch_gate_prompt(prompt):
         gr.Info("批量生图已解锁。")
         noop_result = build_generate_noop_result(
@@ -5563,12 +5558,6 @@ def build_demo() -> gr.Blocks:
                                 value=initial_creative_model_value,
                                 allow_custom_value=True,
                             )
-                            manual_model_box = gr.Textbox(
-                                label="手动模型 ID（可选）",
-                                placeholder="下拉框里没有的模型，在这里直接填完整 ID",
-                                value="",
-                                max_lines=1,
-                            )
                             aspect_ratio_dropdown = gr.Dropdown(
                                 label="宽高比",
                                 choices=ASPECT_RATIO_CHOICES,
@@ -6438,7 +6427,6 @@ def build_demo() -> gr.Blocks:
                 conversations_state,
                 prompt_box,
                 model_dropdown,
-                manual_model_box,
                 google_search_checkbox,
                 image_search_checkbox,
                 reference_image_paths_state,
