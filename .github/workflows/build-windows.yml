@@ -27,9 +27,6 @@ on:
 permissions:
   contents: write
 
-env:
-  DESKTOP_BETA_RELEASE_TAG: v2.3.0-beta.1
-
 jobs:
   windows:
     runs-on: windows-latest
@@ -56,15 +53,20 @@ jobs:
         env:
           REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
+          # 只有推送 v* tag 或手动指定 tag 时才上传到 Release；
+          # 推 main / PR 只构建开发版安装包，作为 artifact 保留，不碰任何 Release。
           $tag = $env:REQUESTED_RELEASE_TAG
+          $publish = 'true'
           if ([string]::IsNullOrWhiteSpace($tag)) {
             if ($env:GITHUB_REF -like 'refs/tags/v*') {
               $tag = $env:GITHUB_REF_NAME
             } else {
-              $tag = $env:DESKTOP_BETA_RELEASE_TAG
+              $tag = "v0.0.0-dev.$($env:GITHUB_SHA.Substring(0, 7))"
+              $publish = 'false'
             }
           }
           "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PUBLISH_RELEASE=$publish" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build branded Windows app
         shell: pwsh
@@ -116,7 +118,7 @@ jobs:
           retention-days: 30
 
       - name: Upload Windows installer to GitHub Release
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && env.PUBLISH_RELEASE == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
