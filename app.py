@@ -84,7 +84,7 @@ MAX_GENERATE_IMAGES = 10
 INITIAL_BATCH_ROWS = 10
 MAX_BATCH_ROWS = 30
 # 每行任务的输入字段数，必须与界面 batch_row_inputs 的顺序、collect_batch_tasks 的解包一致。
-MAX_BATCH_ROW_INPUT_SIZE = 12
+MAX_BATCH_ROW_INPUT_SIZE = 11
 MAX_BATCH_TOTAL_IMAGES = MAX_BATCH_ROWS * MAX_GENERATE_IMAGES
 MAX_REFERENCE_BYTES = 20 * 1024 * 1024
 TEST_MODEL_ID = "gemini-2.5-flash-lite"
@@ -4321,7 +4321,6 @@ def collect_batch_tasks(
             reference_value,
             prompt_value,
             model_id,
-            manual_model_id,
             enable_google_search,
             enable_image_search,
             aspect_ratio,
@@ -4331,8 +4330,6 @@ def collect_batch_tasks(
             keep_seed,
             seed_value,
         ) = row_values[offset : offset + MAX_BATCH_ROW_INPUT_SIZE]
-        # 手填 ID 优先，与创作页一致。
-        model_id = (manual_model_id or "").strip() or model_id
 
         reference_paths = normalize_uploaded_reference_paths(reference_value)
         clean_prompt = (prompt_value or "").strip()
@@ -4436,7 +4433,6 @@ def preview_batch_tasks_handler(
 
 def apply_batch_defaults_handler(
     model_id: str,
-    manual_model_id: str,
     enable_google_search: bool,
     enable_image_search: bool,
     aspect_ratio: str,
@@ -4445,9 +4441,8 @@ def apply_batch_defaults_handler(
     images_per_prompt: int,
 ) -> tuple[Any, ...]:
     """把顶部默认参数一次性同步到全部任务行。"""
-    clean_manual = (manual_model_id or "").strip()
     image_search_update, grounding_hint = refresh_grounding_controls(
-        clean_manual or model_id, enable_google_search, enable_image_search
+        model_id, enable_google_search, enable_image_search
     )
     safe_count = clamp_positive_int(images_per_prompt, 1, MAX_GENERATE_IMAGES)
     updates: list[Any] = []
@@ -4455,7 +4450,6 @@ def apply_batch_defaults_handler(
         updates.extend(
             [
                 gr.update(value=model_id),
-                gr.update(value=clean_manual),
                 gr.update(value=bool(enable_google_search)),
                 image_search_update,
                 gr.update(value=aspect_ratio),
@@ -4481,7 +4475,6 @@ def clear_batch_table_handler(api_protocol: str) -> tuple[Any, ...]:
                 build_batch_reference_hint([]),
                 gr.update(value=""),
                 gr.update(value=default_model),
-                gr.update(value=""),
                 gr.update(value=False),
                 gr.update(value=False, interactive=False),
                 gr.update(value=DEFAULT_PARAMS["aspect_ratio"]),
@@ -5882,12 +5875,6 @@ def build_demo() -> gr.Blocks:
                                 value=initial_edit_model_value,
                                 allow_custom_value=True,
                             )
-                            batch_default_manual_model_box = gr.Textbox(
-                                label="默认手动模型 ID（可选）",
-                                placeholder="下拉框里没有的模型，在这里直接填完整 ID",
-                                value="",
-                                max_lines=1,
-                            )
                             with gr.Row():
                                 batch_default_aspect_ratio_dropdown = gr.Dropdown(
                                     label="默认宽高比",
@@ -5990,12 +5977,6 @@ def build_demo() -> gr.Blocks:
                                         allow_custom_value=True,
                                     )
                                     batch_row_model_dropdowns.append(row_model_dropdown)
-                                    row_manual_model_box = gr.Textbox(
-                                        label="手动模型 ID（可选）",
-                                        placeholder="填了就优先用这个",
-                                        value="",
-                                        max_lines=1,
-                                    )
                                     with gr.Row():
                                         row_aspect_ratio_dropdown = gr.Dropdown(
                                             label="宽高比",
@@ -6047,7 +6028,6 @@ def build_demo() -> gr.Blocks:
                                     row_reference_paths_state,
                                     row_prompt_box,
                                     row_model_dropdown,
-                                    row_manual_model_box,
                                     row_google_search_checkbox,
                                     row_image_search_checkbox,
                                     row_aspect_ratio_dropdown,
@@ -6066,7 +6046,6 @@ def build_demo() -> gr.Blocks:
                                     row_reference_hint,
                                     row_prompt_box,
                                     row_model_dropdown,
-                                    row_manual_model_box,
                                     row_google_search_checkbox,
                                     row_image_search_checkbox,
                                     row_aspect_ratio_dropdown,
@@ -6080,7 +6059,6 @@ def build_demo() -> gr.Blocks:
                             batch_row_default_outputs.extend(
                                 [
                                     row_model_dropdown,
-                                    row_manual_model_box,
                                     row_google_search_checkbox,
                                     row_image_search_checkbox,
                                     row_aspect_ratio_dropdown,
@@ -6283,7 +6261,6 @@ def build_demo() -> gr.Blocks:
             fn=apply_batch_defaults_handler,
             inputs=[
                 batch_default_model_dropdown,
-                batch_default_manual_model_box,
                 batch_default_google_search_checkbox,
                 batch_default_image_search_checkbox,
                 batch_default_aspect_ratio_dropdown,
