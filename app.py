@@ -1,5 +1,6 @@
 import base64
 import json
+import io
 import mimetypes
 import os
 import random
@@ -17,6 +18,16 @@ from pathlib import Path
 from time import perf_counter
 from typing import Callable, Any
 from uuid import uuid4
+
+# PyInstaller 的 --windowed 模式不带控制台，sys.stdout / sys.stderr 会是 None。
+# uvicorn 配置日志时会访问 sys.stdout（内部调用 isatty），直接抛
+# ValueError: Unable to configure formatter 'default' 导致程序起不来。
+# 必须在导入 gradio / uvicorn 之前补上，且要保留 .buffer，避免其他库取二进制流时出错。
+for _std_name in ("stdout", "stderr"):
+    if getattr(sys, _std_name, None) is None:
+        _devnull = io.TextIOWrapper(open(os.devnull, "wb"), encoding="utf-8", errors="replace")
+        setattr(sys, _std_name, _devnull)
+        setattr(sys, f"__{_std_name}__", _devnull)
 
 import gradio as gr
 import httpx
