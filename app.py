@@ -36,6 +36,45 @@ from google import genai
 from google.genai import types
 
 
+def patch_genai_standard_base64() -> bool:
+    """让 google-genai 用标准 base64 发送 inlineData，兼容严格解码的中转站。
+
+    SDK 通过 pydantic 序列化图片字节，用的是 URL-safe base64（以 - _ 代替 + /）。
+    Google 官方接口能接受，但不少中转站按标准 base64 严格解码，会直接报
+    `inlineData is not valid base64`，导致图生图全部失败（文生图没有图片数据，
+    所以不受影响）。SDK 自己的 _base_transformers.t_bytes 用的就是标准 base64，
+    注释里也写明「有些字段不接受 url safe base64」，只是 generateContent 这条
+    路径没用上。这里在 Blob 转换结果上做一次替换。
+    """
+    try:
+        from google.genai import models as genai_models
+    except Exception:
+        return False
+
+    original = getattr(genai_models, "_Blob_to_mldev", None)
+    if original is None or getattr(original, "_standard_base64_patched", False):
+        return False
+
+    def patched(from_object, parent_object=None, root_object=None):
+        converted = original(from_object, parent_object, root_object)
+        if not isinstance(converted, dict):
+            return converted
+        raw = converted.get("data")
+        if isinstance(raw, (bytes, bytearray)):
+            converted["data"] = base64.b64encode(bytes(raw)).decode("ascii")
+        elif isinstance(raw, str):
+            # 标准 base64 里不会出现 - 和 _，这个替换对已经是标准编码的数据无副作用。
+            converted["data"] = raw.replace("-", "+").replace("_", "/")
+        return converted
+
+    patched._standard_base64_patched = True
+    genai_models._Blob_to_mldev = patched
+    return True
+
+
+GENAI_BASE64_PATCHED = patch_genai_standard_base64()
+
+
 # 基础路径与运行配置。
 SOURCE_DIR = Path(__file__).resolve().parent
 
@@ -2468,6 +2507,12 @@ def map_error_message(exc: Exception) -> str:
         return "请求被模型拒绝，可能与安全策略、提示词表述或参考图内容有关。"
     if "output_mime_type parameter is not supported" in normalized:
         return "当前 Gemini 图像接口不支持 output_mime_type 参数，请升级到这份修复后的代码。"
+    if "not valid base64" in normalized or "inlinedata is not valid" in normalized:
+        return (
+            "中转站拒绝了参考图的 base64 编码。这是 google-genai 发送 URL-safe base64、"
+            "而中转站按标准 base64 严格解码导致的；本程序已内置兼容处理，"
+            "若仍出现请确认使用的是最新版本。"
+        )
     if "invalid_request_error" in normalized and "size" in normalized:
         return "所选模型不接受当前 size 参数。请改用自适应比例或服务商支持的尺寸档位。"
     if "not found" in normalized or "404" in normalized:
