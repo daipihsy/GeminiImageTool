@@ -162,6 +162,10 @@ KIE_POLL_TIMEOUT_SECONDS = 900
 # 上传走 base64，体积会涨约 1/3，单文件压到 6MB 以内再传。
 KIE_REFERENCE_BUDGET_BYTES = 6 * 1024 * 1024
 KIE_PENDING_STATES = {"waiting", "queuing", "generating"}
+# 各模型传参考图的字段名不统一，未知模型按这个顺序试，试对了就记住。
+KIE_IMAGE_FIELD_CANDIDATES = ("image_input", "input_urls", "image_urls")
+# 文生图 / 图生图拆成两个模型 ID 的命名后缀（如 gpt-image-2-5-flare-image-to-image）。
+KIE_TASK_MODEL_SUFFIXES = {False: "-text-to-image", True: "-image-to-image"}
 
 # 各模型的参数差异：参考图字段名、张数上限、是否支持 resolution、文生图与图生图
 # 是否拆成两个模型 ID。来源为 kie.ai 官方文档的模型页。
@@ -2009,25 +2013,119 @@ def image_path_to_data_url(path: str) -> str:
     return f"data:{guess_mime_type(image_path)};base64,{encoded}"
 
 
+def load_kie_model_hints() -> dict[str, dict[str, Any]]:
+    """读取此前摸索出来的未登记模型参数。"""
+    hints = load_config().get("kie_model_hints")
+    return hints if isinstance(hints, dict) else {}
+
+
+def save_kie_model_hint(model_id: str, **values: Any) -> None:
+    """记住某个模型的参数形态，下次直接用，不再试错。"""
+    data = load_config()
+    hints = data.get("kie_model_hints")
+    if not isinstance(hints, dict):
+        hints = {}
+    entry = hints.get(model_id) if isinstance(hints.get(model_id), dict) else {}
+    entry.update({key: value for key, value in values.items() if value is not None})
+    hints[model_id] = entry
+    data["kie_model_hints"] = hints
+    write_json_file(CONFIG_PATH, data)
+
+
 def kie_model_spec(model_id: str) -> dict[str, Any]:
-    """取 kie.ai 模型的参数差异；未登记的模型按通用形态处理。"""
-    spec = KIE_MODEL_SPECS.get((model_id or "").strip())
+    """取 kie.ai 模型的参数差异。
+
+    内置清单优先；未登记的模型（比如 kie.ai 以后上新的）先按名字推断，
+    并叠加之前实际调用时摸索出来的结果，因此不必等程序更新就能使用。
+    """
+    clean = (model_id or "").strip()
+    spec = KIE_MODEL_SPECS.get(clean)
     if spec:
         return spec
-    return {
-        "label": model_id,
-        "image_field": "image_input",
+
+    lower = clean.lower()
+    guessed_field = "image_input"
+    split_task_model = False
+    if lower.startswith("gpt-image") or "input_urls" in lower:
+        guessed_field = "input_urls"
+        split_task_model = True
+    elif "lite" in lower:
+        guessed_field = "image_urls"
+
+    inferred: dict[str, Any] = {
+        "label": clean,
+        "image_field": guessed_field,
         "max_references": 10,
         "resolutions": {"1K", "2K", "4K"},
         "aspects": set(GPT_IMAGE_2_VIP_SIZES["2K"].keys()),
+        "split_task_model": split_task_model,
+        "inferred": True,
     }
+    hint = load_kie_model_hints().get(clean)
+    if isinstance(hint, dict):
+        if hint.get("image_field"):
+            inferred["image_field"] = hint["image_field"]
+        if hint.get("supports_resolution") is False:
+            inferred["resolutions"] = set()
+        if hint.get("split_task_model") is not None:
+            inferred["split_task_model"] = bool(hint["split_task_model"])
+    return inferred
 
 
 def kie_task_model_id(model_id: str, has_references: bool) -> str:
     """GPT Image 2.5 把文生图和图生图拆成两个模型 ID，这里按有无参考图选择。"""
     spec = kie_model_spec(model_id)
-    key = "image_to_image_model" if has_references else "text_to_image_model"
-    return spec.get(key) or model_id
+    explicit = spec.get("image_to_image_model" if has_references else "text_to_image_model")
+    if explicit:
+        return str(explicit)
+    if spec.get("split_task_model"):
+        suffix = KIE_TASK_MODEL_SUFFIXES[bool(has_references)]
+        if not model_id.endswith(suffix):
+            return f"{model_id}{suffix}"
+    return model_id
+
+
+def kie_adjust_after_error(
+    message: str,
+    image_field: str,
+    send_resolution: bool,
+    task_model: str,
+    model_id: str,
+    has_references: bool,
+    tried_fields: set[str],
+) -> tuple[str, bool, str] | None:
+    """根据 kie.ai 的报错决定下一次换什么参数重试；无计可施时返回 None。
+
+    kie.ai 的校验错误通常会点名缺少或不认识的字段，所以优先照着报错改；
+    报错没写清楚时，再按候选字段顺序挨个试。
+    """
+    text = (message or "").lower()
+
+    # 报错里点名了另一个参考图字段，直接改用它。
+    if has_references:
+        for candidate in KIE_IMAGE_FIELD_CANDIDATES:
+            if candidate != image_field and candidate in text:
+                return candidate, send_resolution, task_model
+
+    # 报错指向 resolution：该模型多半不支持这个参数。
+    if send_resolution and "resolution" in text:
+        return image_field, False, task_model
+
+    # 模型不存在：可能是文生图 / 图生图拆成了两个 ID。
+    if any(word in text for word in ("not found", "not exist", "不存在", "no available", "model")):
+        suffix = KIE_TASK_MODEL_SUFFIXES[bool(has_references)]
+        other = KIE_TASK_MODEL_SUFFIXES[not has_references]
+        if task_model.endswith(other):
+            return image_field, send_resolution, task_model[: -len(other)] + suffix
+        if not task_model.endswith(suffix):
+            return image_field, send_resolution, f"{model_id}{suffix}"
+
+    # 报错没写清楚，按候选顺序换下一个字段名。
+    if has_references:
+        for candidate in KIE_IMAGE_FIELD_CANDIDATES:
+            if candidate not in tried_fields:
+                return candidate, send_resolution, task_model
+    return None
 
 
 def kie_url(api_base_url: str, path: str) -> str:
@@ -2154,38 +2252,72 @@ def generate_kie_image(
 
     notes: list[str] = []
     with make_httpx_client(proxy_url) as client:
-        task_input: dict[str, Any] = {"prompt": prompt}
+        reference_urls: list[str] = []
         if references:
-            urls, upload_note = kie_upload_reference_images(client, api_key, references)
-            task_input[str(spec["image_field"])] = urls
+            reference_urls, upload_note = kie_upload_reference_images(client, api_key, references)
             if upload_note:
                 notes.append(upload_note)
-        # 省略该字段时，部分模型会默认 1:1 而不是自适应，所以显式传 auto。
-        task_input["aspect_ratio"] = api_aspect_ratio or "auto"
-        supported_resolutions = set(spec.get("resolutions") or set())
-        if resolution in supported_resolutions:
-            task_input["resolution"] = resolution
-        elif resolution not in {"512", "1K"}:
+
+        image_field = str(spec["image_field"])
+        task_model = kie_task_model_id(model_id, bool(references))
+        send_resolution = resolution in set(spec.get("resolutions") or set())
+        if not send_resolution and resolution not in {"512", "1K"} and not spec.get("inferred"):
             notes.append(
                 f"`{model_id}` 没有分辨率参数，`{resolution}` 不会生效，实际会按该模型的默认尺寸出图。"
             )
 
-        created = kie_unwrap(
-            parse_json_response(
-                client.post(
-                    kie_url(api_base_url, KIE_CREATE_TASK_PATH),
-                    headers=kie_headers(api_key),
-                    json={
-                        "model": kie_task_model_id(model_id, bool(references)),
-                        "input": task_input,
-                    },
+        # 未登记的模型可能用别的字段名或拆分模型 ID，按报错逐步纠正，成功后记住。
+        initial = (image_field, send_resolution, task_model)
+        tried_fields = {image_field}
+        task_id = ""
+        for attempt in range(4):
+            task_input: dict[str, Any] = {
+                "prompt": prompt,
+                # 省略该字段时部分模型会默认 1:1 而不是自适应，所以显式传 auto。
+                "aspect_ratio": api_aspect_ratio or "auto",
+            }
+            if reference_urls:
+                task_input[image_field] = reference_urls
+            if send_resolution:
+                task_input["resolution"] = resolution
+            try:
+                created = kie_unwrap(
+                    parse_json_response(
+                        client.post(
+                            kie_url(api_base_url, KIE_CREATE_TASK_PATH),
+                            headers=kie_headers(api_key),
+                            json={"model": task_model, "input": task_input},
+                        )
+                    ),
+                    "创建任务",
                 )
-            ),
-            "创建任务",
-        )
-        task_id = created.get("taskId")
-        if not task_id:
-            raise RuntimeError("创建任务失败：返回里没有 taskId。")
+                task_id = str(created.get("taskId") or "")
+                if task_id:
+                    break
+                raise RuntimeError("创建任务失败：返回里没有 taskId。")
+            except RuntimeError as exc:
+                adjusted = kie_adjust_after_error(
+                    str(exc), image_field, send_resolution, task_model,
+                    model_id, bool(reference_urls), tried_fields,
+                )
+                if adjusted is None or attempt == 3:
+                    raise
+                image_field, send_resolution, task_model = adjusted
+                tried_fields.add(image_field)
+
+        if (image_field, send_resolution, task_model) != initial:
+            save_kie_model_hint(
+                model_id,
+                image_field=image_field,
+                supports_resolution=send_resolution,
+                split_task_model=task_model != model_id,
+            )
+            notes.append(
+                f"已自动摸清 `{model_id}` 的调用方式（参考图字段 `{image_field}`"
+                f"{'，不支持 resolution' if not send_resolution else ''}），后续不再试错。"
+            )
+            if not send_resolution and resolution not in {"512", "1K"}:
+                notes.append(f"该模型不接受分辨率参数，`{resolution}` 未生效。")
 
         result_urls = kie_wait_for_task(client, api_key, api_base_url, str(task_id))
         downloaded = client.get(result_urls[0])
