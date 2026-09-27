@@ -141,11 +141,77 @@ TEST_MODEL_ID = "gemini-2.5-flash-lite"
 API_PROTOCOL_GEMINI = "gemini"
 API_PROTOCOL_OPENAI_IMAGES = "openai_images"
 API_PROTOCOL_OPENAI_CHAT = "openai_chat"
+API_PROTOCOL_KIE = "kie"
 API_PROTOCOL_CHOICES = [
     ("Gemini 原生（generateContent）", API_PROTOCOL_GEMINI),
     ("OpenAI Images（/v1/images）", API_PROTOCOL_OPENAI_IMAGES),
     ("OpenAI Chat 生图（/v1/chat/completions）", API_PROTOCOL_OPENAI_CHAT),
+    ("KIE 异步任务（kie.ai）", API_PROTOCOL_KIE),
 ]
+
+# ── kie.ai ────────────────────────────────────────────────────────────────
+# kie.ai 不兼容 OpenAI / Gemini 接口：提交任务只返回 taskId，要再轮询取结果，
+# 参考图也必须先上传换成 URL。因此单独作为一种协议处理。
+KIE_DEFAULT_BASE_URL = "https://api.kie.ai"
+KIE_UPLOAD_URL = "https://kieai.redpandaai.co/api/file-base64-upload"
+KIE_UPLOAD_PATH = "images/gemini-image-tool"
+KIE_CREATE_TASK_PATH = "/api/v1/jobs/createTask"
+KIE_RECORD_INFO_PATH = "/api/v1/jobs/recordInfo"
+KIE_POLL_INTERVAL_SECONDS = 3.0
+KIE_POLL_TIMEOUT_SECONDS = 900
+# 上传走 base64，体积会涨约 1/3，单文件压到 6MB 以内再传。
+KIE_REFERENCE_BUDGET_BYTES = 6 * 1024 * 1024
+KIE_PENDING_STATES = {"waiting", "queuing", "generating"}
+# 各模型传参考图的字段名不统一，未知模型按这个顺序试，试对了就记住。
+KIE_IMAGE_FIELD_CANDIDATES = ("image_input", "input_urls", "image_urls")
+# 文生图 / 图生图拆成两个模型 ID 的命名后缀（如 gpt-image-2-5-flare-image-to-image）。
+KIE_TASK_MODEL_SUFFIXES = {False: "-text-to-image", True: "-image-to-image"}
+
+# 各模型的参数差异：参考图字段名、张数上限、是否支持 resolution、文生图与图生图
+# 是否拆成两个模型 ID。来源为 kie.ai 官方文档的模型页。
+KIE_MODEL_SPECS: dict[str, dict[str, Any]] = {
+    "nano-banana-2": {
+        "label": "Nano Banana 2（kie.ai）— 1K/2K/4K",
+        "image_field": "image_input",
+        "max_references": 14,
+        "resolutions": {"1K", "2K", "4K"},
+        "aspects": {"1:1", "2:3", "3:2", "1:4", "4:1", "3:4", "4:3", "4:5", "5:4",
+                    "1:8", "8:1", "9:16", "16:9", "21:9"},
+    },
+    "nano-banana-pro": {
+        "label": "Nano Banana Pro（kie.ai）— 1K/2K/4K",
+        "image_field": "image_input",
+        "max_references": 8,
+        "resolutions": {"1K", "2K", "4K"},
+        "aspects": {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"},
+    },
+    "nano-banana-2-lite": {
+        "label": "Nano Banana 2 Lite（kie.ai）— 只有 1K",
+        "image_field": "image_urls",
+        "max_references": 10,
+        "resolutions": set(),  # 该模型没有 resolution 参数，只能出 1K
+        "aspects": {"1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5",
+                    "5:4", "8:1", "9:16", "16:9", "21:9"},
+    },
+    "gpt-image-2-5-sunburst": {
+        "label": "GPT Image 2.5 Sunburst（kie.ai）— 1K/2K/4K",
+        "image_field": "input_urls",
+        "max_references": 16,
+        "resolutions": {"1K", "2K", "4K"},
+        "aspects": {"1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "21:9"},
+        "text_to_image_model": "gpt-image-2-5-sunburst-text-to-image",
+        "image_to_image_model": "gpt-image-2-5-sunburst-image-to-image",
+    },
+    "gpt-image-2-5-flare": {
+        "label": "GPT Image 2.5 Flare（kie.ai）— 1K/2K/4K",
+        "image_field": "input_urls",
+        "max_references": 16,
+        "resolutions": {"1K", "2K", "4K"},
+        "aspects": {"1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "21:9"},
+        "text_to_image_model": "gpt-image-2-5-flare-text-to-image",
+        "image_to_image_model": "gpt-image-2-5-flare-image-to-image",
+    },
+}
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 LEGACY_APIYI_BASE_URL = "https://api.apiyi.com"
 GPT_IMAGE_2_VIP_MODEL_ID = "gpt-image-2-vip"
@@ -297,6 +363,22 @@ MODEL_OPTIONS = [
         "api_kind": API_PROTOCOL_OPENAI_IMAGES,
     },
 ]
+# kie.ai 的模型按上面的参数表登记，能力判断、比例裁切、分辨率提示都能复用现有逻辑。
+MODEL_OPTIONS.extend(
+    {
+        "label": spec["label"],
+        "value": kie_model_id,
+        "short_name": kie_model_id,
+        # 没有 resolution 参数的模型（如 Lite）只当作原生 1K，选 2K 时会给出提示。
+        "native_sizes": set(spec["resolutions"]) or {"1K"},
+        "native_aspects": set(spec["aspects"]),
+        "supports_google_search": False,
+        "supports_image_search": False,
+        "supports_quality": False,
+        "api_kind": API_PROTOCOL_KIE,
+    }
+    for kie_model_id, spec in KIE_MODEL_SPECS.items()
+)
 MODEL_BY_ID = {item["value"]: item for item in MODEL_OPTIONS}
 MODEL_LABELS = {item["value"]: item["label"] for item in MODEL_OPTIONS}
 
@@ -737,9 +819,12 @@ def normalize_api_protocol(api_protocol: str | None) -> str:
         "openai-images": API_PROTOCOL_OPENAI_IMAGES,
         "chat": API_PROTOCOL_OPENAI_CHAT,
         "openai-chat": API_PROTOCOL_OPENAI_CHAT,
+        "kie.ai": API_PROTOCOL_KIE,
+        "kieai": API_PROTOCOL_KIE,
     }
     value = aliases.get(value, value)
-    if value in {API_PROTOCOL_GEMINI, API_PROTOCOL_OPENAI_IMAGES, API_PROTOCOL_OPENAI_CHAT}:
+    if value in {API_PROTOCOL_GEMINI, API_PROTOCOL_OPENAI_IMAGES, API_PROTOCOL_OPENAI_CHAT,
+                 API_PROTOCOL_KIE}:
         return value
     return API_PROTOCOL_GEMINI
 
@@ -751,6 +836,7 @@ def protocol_display_name(api_protocol: str) -> str:
         API_PROTOCOL_GEMINI: "Gemini 原生",
         API_PROTOCOL_OPENAI_IMAGES: "OpenAI Images",
         API_PROTOCOL_OPENAI_CHAT: "OpenAI Chat 生图",
+        API_PROTOCOL_KIE: "KIE 异步任务",
     }[protocol]
 
 
@@ -1927,6 +2013,333 @@ def image_path_to_data_url(path: str) -> str:
     return f"data:{guess_mime_type(image_path)};base64,{encoded}"
 
 
+def load_kie_model_hints() -> dict[str, dict[str, Any]]:
+    """读取此前摸索出来的未登记模型参数。"""
+    hints = load_config().get("kie_model_hints")
+    return hints if isinstance(hints, dict) else {}
+
+
+def save_kie_model_hint(model_id: str, **values: Any) -> None:
+    """记住某个模型的参数形态，下次直接用，不再试错。"""
+    data = load_config()
+    hints = data.get("kie_model_hints")
+    if not isinstance(hints, dict):
+        hints = {}
+    entry = hints.get(model_id) if isinstance(hints.get(model_id), dict) else {}
+    entry.update({key: value for key, value in values.items() if value is not None})
+    hints[model_id] = entry
+    data["kie_model_hints"] = hints
+    write_json_file(CONFIG_PATH, data)
+
+
+def kie_model_spec(model_id: str) -> dict[str, Any]:
+    """取 kie.ai 模型的参数差异。
+
+    内置清单优先；未登记的模型（比如 kie.ai 以后上新的）先按名字推断，
+    并叠加之前实际调用时摸索出来的结果，因此不必等程序更新就能使用。
+    """
+    clean = (model_id or "").strip()
+    spec = KIE_MODEL_SPECS.get(clean)
+    if spec:
+        return spec
+
+    lower = clean.lower()
+    guessed_field = "image_input"
+    split_task_model = False
+    if lower.startswith("gpt-image") or "input_urls" in lower:
+        guessed_field = "input_urls"
+        split_task_model = True
+    elif "lite" in lower:
+        guessed_field = "image_urls"
+
+    inferred: dict[str, Any] = {
+        "label": clean,
+        "image_field": guessed_field,
+        "max_references": 10,
+        "resolutions": {"1K", "2K", "4K"},
+        "aspects": set(GPT_IMAGE_2_VIP_SIZES["2K"].keys()),
+        "split_task_model": split_task_model,
+        "inferred": True,
+    }
+    hint = load_kie_model_hints().get(clean)
+    if isinstance(hint, dict):
+        if hint.get("image_field"):
+            inferred["image_field"] = hint["image_field"]
+        if hint.get("supports_resolution") is False:
+            inferred["resolutions"] = set()
+        if hint.get("split_task_model") is not None:
+            inferred["split_task_model"] = bool(hint["split_task_model"])
+    return inferred
+
+
+def kie_task_model_id(model_id: str, has_references: bool) -> str:
+    """GPT Image 2.5 把文生图和图生图拆成两个模型 ID，这里按有无参考图选择。"""
+    spec = kie_model_spec(model_id)
+    explicit = spec.get("image_to_image_model" if has_references else "text_to_image_model")
+    if explicit:
+        return str(explicit)
+    if spec.get("split_task_model"):
+        suffix = KIE_TASK_MODEL_SUFFIXES[bool(has_references)]
+        if not model_id.endswith(suffix):
+            return f"{model_id}{suffix}"
+    return model_id
+
+
+def kie_adjust_after_error(
+    message: str,
+    image_field: str,
+    send_resolution: bool,
+    task_model: str,
+    model_id: str,
+    has_references: bool,
+    tried_fields: set[str],
+) -> tuple[str, bool, str] | None:
+    """根据 kie.ai 的报错决定下一次换什么参数重试；无计可施时返回 None。
+
+    kie.ai 的校验错误通常会点名缺少或不认识的字段，所以优先照着报错改；
+    报错没写清楚时，再按候选字段顺序挨个试。
+    """
+    text = (message or "").lower()
+
+    # 报错里点名了另一个参考图字段，直接改用它。
+    if has_references:
+        for candidate in KIE_IMAGE_FIELD_CANDIDATES:
+            if candidate != image_field and candidate in text:
+                return candidate, send_resolution, task_model
+
+    # 报错指向 resolution：该模型多半不支持这个参数。
+    if send_resolution and "resolution" in text:
+        return image_field, False, task_model
+
+    # 模型不存在：可能是文生图 / 图生图拆成了两个 ID。
+    if any(word in text for word in ("not found", "not exist", "不存在", "no available", "model")):
+        suffix = KIE_TASK_MODEL_SUFFIXES[bool(has_references)]
+        other = KIE_TASK_MODEL_SUFFIXES[not has_references]
+        if task_model.endswith(other):
+            return image_field, send_resolution, task_model[: -len(other)] + suffix
+        if not task_model.endswith(suffix):
+            return image_field, send_resolution, f"{model_id}{suffix}"
+
+    # 报错没写清楚，按候选顺序换下一个字段名。
+    if has_references:
+        for candidate in KIE_IMAGE_FIELD_CANDIDATES:
+            if candidate not in tried_fields:
+                return candidate, send_resolution, task_model
+    return None
+
+
+def kie_url(api_base_url: str, path: str) -> str:
+    base = normalize_api_base_url(api_base_url) or KIE_DEFAULT_BASE_URL
+    return f"{base.rstrip('/')}{path}"
+
+
+def kie_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {normalize_api_key(api_key)}",
+        "Content-Type": "application/json",
+    }
+
+
+def kie_unwrap(payload: Any, action: str) -> dict[str, Any]:
+    """kie.ai 即使 HTTP 200 也可能在响应体里用 code 表示失败。"""
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{action}失败：返回内容不是合法的 JSON 对象。")
+    code = payload.get("code")
+    if code not in (200, None):
+        raise RuntimeError(f"{action}失败（code {code}）：{payload.get('msg') or '无错误描述'}")
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def kie_upload_reference_images(
+    client: httpx.Client,
+    api_key: str,
+    paths: list[str],
+) -> tuple[list[str], str | None]:
+    """把本地参考图上传到 kie.ai，换成它要求的图片 URL。
+
+    kie.ai 的生成接口只接受 URL，不收文件内容。上传免费，文件 24 小时后自动删除，
+    对一次性生成足够用。base64 会让体积涨约 1/3，所以先压到预算内再传。
+    """
+    budget = KIE_REFERENCE_BUDGET_BYTES * max(1, len(paths))
+    items, changes = fit_references_to_limit(
+        paths, lambda parts: sum(len(data) for _, data, _ in parts), budget
+    )
+    urls: list[str] = []
+    for name, data, mime_type in items:
+        response = client.post(
+            KIE_UPLOAD_URL,
+            headers=kie_headers(api_key),
+            json={
+                "base64Data": bytes_to_data_url(data, mime_type),
+                "uploadPath": KIE_UPLOAD_PATH,
+                "fileName": f"{uuid4().hex}-{Path(name).name}",
+            },
+        )
+        uploaded = kie_unwrap(parse_json_response(response), "上传参考图")
+        url = uploaded.get("downloadUrl")
+        if not url:
+            raise RuntimeError("上传参考图失败：返回里没有 downloadUrl。")
+        urls.append(str(url))
+    note = (
+        "参考图已压缩后上传：" + "；".join(changes) + "。只影响参考图，不影响出图分辨率。"
+        if changes
+        else None
+    )
+    return urls, note
+
+
+def kie_wait_for_task(
+    client: httpx.Client,
+    api_key: str,
+    api_base_url: str,
+    task_id: str,
+) -> list[str]:
+    """轮询任务直到成功或失败，返回结果图片的 URL 列表。"""
+    deadline = perf_counter() + KIE_POLL_TIMEOUT_SECONDS
+    last_state = ""
+    while True:
+        response = client.get(
+            kie_url(api_base_url, KIE_RECORD_INFO_PATH),
+            headers=kie_headers(api_key),
+            params={"taskId": task_id},
+        )
+        data = kie_unwrap(parse_json_response(response), "查询任务")
+        state = str(data.get("state") or "").strip().lower()
+        last_state = state or last_state
+        if state == "success":
+            try:
+                result = json.loads(data.get("resultJson") or "{}")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"任务已完成，但结果无法解析：{exc}") from exc
+            urls = [str(item) for item in (result.get("resultUrls") or []) if item]
+            if not urls:
+                raise RuntimeError("任务已完成，但结果里没有图片链接。")
+            return urls
+        if state == "fail":
+            raise RuntimeError(
+                f"任务失败（{data.get('failCode') or '无代码'}）：{data.get('failMsg') or '无描述'}"
+            )
+        if state and state not in KIE_PENDING_STATES:
+            raise RuntimeError(f"任务返回了未知状态：{state}")
+        if perf_counter() > deadline:
+            raise RuntimeError(
+                f"等待任务超时（{KIE_POLL_TIMEOUT_SECONDS // 60} 分钟），最后状态为 "
+                f"`{last_state or '未知'}`。任务可能仍在 kie.ai 后台运行，可到其日志页查看。"
+            )
+        threading.Event().wait(KIE_POLL_INTERVAL_SECONDS)
+
+
+def generate_kie_image(
+    api_key: str,
+    proxy_url: str,
+    api_base_url: str,
+    model_id: str,
+    prompt: str,
+    reference_paths: list[str] | None,
+    resolution: str,
+    api_aspect_ratio: str | None,
+    keep_alpha: bool = False,
+) -> tuple[Image.Image, str | None]:
+    """走 kie.ai 的异步任务：上传参考图 → 建任务 → 轮询 → 下载结果。"""
+    spec = kie_model_spec(model_id)
+    references = list(reference_paths or [])
+    max_references = int(spec.get("max_references") or 10)
+    if len(references) > max_references:
+        raise ValueError(
+            f"`{model_id}` 最多支持 {max_references} 张参考图，当前有 {len(references)} 张。"
+        )
+
+    notes: list[str] = []
+    with make_httpx_client(proxy_url) as client:
+        reference_urls: list[str] = []
+        if references:
+            reference_urls, upload_note = kie_upload_reference_images(client, api_key, references)
+            if upload_note:
+                notes.append(upload_note)
+
+        image_field = str(spec["image_field"])
+        task_model = kie_task_model_id(model_id, bool(references))
+        send_resolution = resolution in set(spec.get("resolutions") or set())
+        if not send_resolution and resolution not in {"512", "1K"} and not spec.get("inferred"):
+            notes.append(
+                f"`{model_id}` 没有分辨率参数，`{resolution}` 不会生效，实际会按该模型的默认尺寸出图。"
+            )
+
+        # 未登记的模型可能用别的字段名或拆分模型 ID，按报错逐步纠正，成功后记住。
+        initial = (image_field, send_resolution, task_model)
+        tried_fields = {image_field}
+        task_id = ""
+        for attempt in range(4):
+            task_input: dict[str, Any] = {
+                "prompt": prompt,
+                # 省略该字段时部分模型会默认 1:1 而不是自适应，所以显式传 auto。
+                "aspect_ratio": api_aspect_ratio or "auto",
+            }
+            if reference_urls:
+                task_input[image_field] = reference_urls
+            if send_resolution:
+                task_input["resolution"] = resolution
+            try:
+                created = kie_unwrap(
+                    parse_json_response(
+                        client.post(
+                            kie_url(api_base_url, KIE_CREATE_TASK_PATH),
+                            headers=kie_headers(api_key),
+                            json={"model": task_model, "input": task_input},
+                        )
+                    ),
+                    "创建任务",
+                )
+                task_id = str(created.get("taskId") or "")
+                if task_id:
+                    break
+                raise RuntimeError("创建任务失败：返回里没有 taskId。")
+            except RuntimeError as exc:
+                adjusted = kie_adjust_after_error(
+                    str(exc), image_field, send_resolution, task_model,
+                    model_id, bool(reference_urls), tried_fields,
+                )
+                if adjusted is None or attempt == 3:
+                    raise
+                image_field, send_resolution, task_model = adjusted
+                tried_fields.add(image_field)
+
+        if (image_field, send_resolution, task_model) != initial:
+            save_kie_model_hint(
+                model_id,
+                image_field=image_field,
+                supports_resolution=send_resolution,
+                split_task_model=task_model != model_id,
+            )
+            notes.append(
+                f"已自动摸清 `{model_id}` 的调用方式（参考图字段 `{image_field}`"
+                f"{'，不支持 resolution' if not send_resolution else ''}），后续不再试错。"
+            )
+            if not send_resolution and resolution not in {"512", "1K"}:
+                notes.append(f"该模型不接受分辨率参数，`{resolution}` 未生效。")
+
+        result_urls = kie_wait_for_task(client, api_key, api_base_url, str(task_id))
+        downloaded = client.get(result_urls[0])
+        if downloaded.status_code >= 400:
+            raise RuntimeError(f"下载生成结果失败：HTTP {downloaded.status_code}")
+        image = Image.open(BytesIO(downloaded.content))
+        image.load()
+
+    if keep_alpha and image.mode in ("RGBA", "LA", "P"):
+        image = image.convert("RGBA")
+    else:
+        image = image.convert("RGB")
+
+    requested_longest = LONGEST_SIDE_BY_RESOLUTION.get(resolution)
+    if requested_longest and max(image.size) < requested_longest:
+        notes.append(
+            f"请求 `{resolution}`，实际只返回 `{image.size[0]}x{image.size[1]}`；"
+            "已按真实像素保存，未做本地放大。"
+        )
+    return image, ("\n\n".join(notes) or None)
+
+
 def generate_openai_image(
     api_key: str,
     proxy_url: str,
@@ -2212,6 +2625,10 @@ def resolve_protocol_aspect_ratio(
         return resolve_aspect_ratio(model_id, aspect_ratio)
     if aspect_ratio == AUTO_ASPECT_RATIO:
         return None, False
+    if protocol == API_PROTOCOL_KIE:
+        if aspect_ratio in kie_model_spec(model_id).get("aspects", set()):
+            return aspect_ratio, False
+        return None, True  # 非原生比例：让模型自行决定，再本地裁切
     if protocol == API_PROTOCOL_OPENAI_CHAT:
         return None, True
     # 已登记能力的模型（VIP、RollDek 系列）直接按其原生比例表判断，避免无谓的本地裁切。
@@ -3618,6 +4035,9 @@ def list_available_models(
     protocol = normalize_api_protocol(api_protocol)
     seen: set[str] = set()
     ordered: list[str] = []
+    if protocol == API_PROTOCOL_KIE:
+        # kie.ai 没有提供列出模型的接口，返回内置清单；下拉框支持直接输入其它模型 ID。
+        return list(KIE_MODEL_SPECS)
     if protocol == API_PROTOCOL_GEMINI:
         client = make_client(api_key, proxy_url, api_base_url)
         raw_ids = []
@@ -3660,10 +4080,16 @@ def get_initial_model_choices(api_protocol: str = API_PROTOCOL_GEMINI) -> list[t
     detected = load_available_models(protocol)
     if detected:
         return build_model_choices(detected)
-    if protocol == API_PROTOCOL_OPENAI_IMAGES:
+    if protocol == API_PROTOCOL_KIE:
+        built_in = [item for item in MODEL_OPTIONS if item.get("api_kind") == API_PROTOCOL_KIE]
+    elif protocol == API_PROTOCOL_OPENAI_IMAGES:
         built_in = [item for item in MODEL_OPTIONS if item.get("api_kind") == API_PROTOCOL_OPENAI_IMAGES]
     else:
-        built_in = [item for item in MODEL_OPTIONS if item.get("api_kind") != API_PROTOCOL_OPENAI_IMAGES]
+        built_in = [
+            item
+            for item in MODEL_OPTIONS
+            if item.get("api_kind") not in (API_PROTOCOL_OPENAI_IMAGES, API_PROTOCOL_KIE)
+        ]
     return [(item["label"], item["value"]) for item in built_in]
 
 
@@ -3677,11 +4103,19 @@ def refresh_protocol_ui(
     values = [value for _, value in choices]
     selected = current_model if current_model in values else values[0]
     is_gemini = protocol == API_PROTOCOL_GEMINI
-    endpoint = "Google 官方端点" if is_gemini else "OpenAI 官方端点"
-    hint = (
-        f"已切换到 **{protocol_display_name(protocol)}**。Base URL 留空时使用{endpoint}；"
-        "使用中转站时请填写其地址，然后点“检测可用模型”。"
-    )
+    if protocol == API_PROTOCOL_KIE:
+        hint = (
+            f"已切换到 **{protocol_display_name(protocol)}**。Base URL 留空时使用 "
+            f"`{KIE_DEFAULT_BASE_URL}`。kie.ai 没有列出模型的接口，下拉框是内置清单，"
+            "其它模型可直接在下拉框里输入 ID。生成是异步的：提交任务后会自动轮询结果，"
+            "因此首张图通常比其它协议慢一些。"
+        )
+    else:
+        endpoint = "Google 官方端点" if is_gemini else "OpenAI 官方端点"
+        hint = (
+            f"已切换到 **{protocol_display_name(protocol)}**。Base URL 留空时使用{endpoint}；"
+            "使用中转站时请填写其地址，然后点“检测可用模型”。"
+        )
     row_updates = [gr.update(choices=choices) for _ in range(MAX_BATCH_ROWS)]
     google_update = gr.update(interactive=True) if is_gemini else gr.update(value=False, interactive=False)
     keep_seed_update = gr.update(interactive=True) if is_gemini else gr.update(value=False, interactive=False)
@@ -4016,6 +4450,19 @@ def generate_handler(
                 )
                 if size_mismatch_note and size_mismatch_note not in resolution_notes:
                     resolution_notes.append(size_mismatch_note)
+            elif protocol == API_PROTOCOL_KIE:
+                image, kie_note = generate_kie_image(
+                    api_key=api_key,
+                    proxy_url=proxy_url,
+                    api_base_url=api_base_url,
+                    model_id=model_id,
+                    prompt=effective_prompt,
+                    reference_paths=reference_paths,
+                    resolution=resolution,
+                    api_aspect_ratio=api_aspect_ratio,
+                )
+                if kie_note and kie_note not in resolution_notes:
+                    resolution_notes.append(kie_note)
             elif protocol == API_PROTOCOL_OPENAI_CHAT:
                 image = generate_openai_chat_image(
                     api_key=api_key,
@@ -4782,6 +5229,19 @@ def batch_generate_handler(
                     )
                     if size_mismatch_note and size_mismatch_note not in row_notes:
                         row_notes.append(size_mismatch_note)
+                elif protocol == API_PROTOCOL_KIE:
+                    image, kie_note = generate_kie_image(
+                        api_key=api_key,
+                        proxy_url=proxy_url,
+                        api_base_url=api_base_url,
+                        model_id=task["model_id"],
+                        prompt=effective_prompt,
+                        reference_paths=task["reference_paths"],
+                        resolution=task["resolution"],
+                        api_aspect_ratio=api_aspect_ratio,
+                    )
+                    if kie_note and kie_note not in row_notes:
+                        row_notes.append(kie_note)
                 elif protocol == API_PROTOCOL_OPENAI_CHAT:
                     image = generate_openai_chat_image(
                         api_key=api_key,
@@ -5033,6 +5493,19 @@ def run_protocol_image_edit(
     protocol = normalize_api_protocol(api_protocol)
     if protocol == API_PROTOCOL_OPENAI_IMAGES:
         edited_image, _ = generate_openai_image(
+            api_key=api_key,
+            proxy_url=proxy_url,
+            api_base_url=api_base_url,
+            model_id=model_id,
+            prompt=prompt,
+            reference_paths=image_paths,
+            resolution="1K",
+            api_aspect_ratio=None,
+            keep_alpha=keep_alpha,
+        )
+        return edited_image
+    if protocol == API_PROTOCOL_KIE:
+        edited_image, _ = generate_kie_image(
             api_key=api_key,
             proxy_url=proxy_url,
             api_base_url=api_base_url,
