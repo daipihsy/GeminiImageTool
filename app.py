@@ -167,51 +167,50 @@ KIE_IMAGE_FIELD_CANDIDATES = ("image_input", "input_urls", "image_urls")
 # 文生图 / 图生图拆成两个模型 ID 的命名后缀（如 gpt-image-2-5-flare-image-to-image）。
 KIE_TASK_MODEL_SUFFIXES = {False: "-text-to-image", True: "-image-to-image"}
 
-# 各模型的参数差异：参考图字段名、张数上限、是否支持 resolution、文生图与图生图
-# 是否拆成两个模型 ID。来源为 kie.ai 官方文档的模型页。
-KIE_MODEL_SPECS: dict[str, dict[str, Any]] = {
-    "nano-banana-2": {
-        "label": "Nano Banana 2（kie.ai）— 1K/2K/4K",
-        "image_field": "image_input",
-        "max_references": 14,
-        "resolutions": {"1K", "2K", "4K"},
-        "aspects": {"1:1", "2:3", "3:2", "1:4", "4:1", "3:4", "4:3", "4:5", "5:4",
-                    "1:8", "8:1", "9:16", "16:9", "21:9"},
-    },
-    "nano-banana-pro": {
-        "label": "Nano Banana Pro（kie.ai）— 1K/2K/4K",
-        "image_field": "image_input",
-        "max_references": 8,
-        "resolutions": {"1K", "2K", "4K"},
-        "aspects": {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"},
-    },
-    "nano-banana-2-lite": {
-        "label": "Nano Banana 2 Lite（kie.ai）— 只有 1K",
-        "image_field": "image_urls",
-        "max_references": 10,
-        "resolutions": set(),  # 该模型没有 resolution 参数，只能出 1K
-        "aspects": {"1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5",
-                    "5:4", "8:1", "9:16", "16:9", "21:9"},
-    },
-    "gpt-image-2-5-sunburst": {
-        "label": "GPT Image 2.5 Sunburst（kie.ai）— 1K/2K/4K",
-        "image_field": "input_urls",
-        "max_references": 16,
-        "resolutions": {"1K", "2K", "4K"},
-        "aspects": {"1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "21:9"},
-        "text_to_image_model": "gpt-image-2-5-sunburst-text-to-image",
-        "image_to_image_model": "gpt-image-2-5-sunburst-image-to-image",
-    },
-    "gpt-image-2-5-flare": {
-        "label": "GPT Image 2.5 Flare（kie.ai）— 1K/2K/4K",
-        "image_field": "input_urls",
-        "max_references": 16,
-        "resolutions": {"1K", "2K", "4K"},
-        "aspects": {"1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "21:9"},
-        "text_to_image_model": "gpt-image-2-5-flare-text-to-image",
-        "image_to_image_model": "gpt-image-2-5-flare-image-to-image",
-    },
+# 画幅预设词与比例的对应（部分模型用 landscape_4_3 这类词代替 4:3）。
+KIE_ASPECT_PRESET_TO_RATIO = {
+    "square": "1:1", "square_hd": "1:1",
+    "portrait_4_3": "3:4", "landscape_4_3": "4:3",
+    "portrait_3_2": "2:3", "landscape_3_2": "3:2",
+    "portrait_16_9": "9:16", "landscape_16_9": "16:9",
 }
+
+
+def _load_kie_model_specs() -> dict[str, dict[str, Any]]:
+    """载入由 tools/refresh_kie_models.py 从 kie.ai 文档生成的模型参数表。
+
+    kie.ai 上各家模型的参考图字段、分辨率字段和取值都不统一，必须逐个登记：
+    参考图有 image_urls / input_urls / image_input / image_url 等写法，
+    分辨率有 resolution / image_resolution，画幅有 aspect_ratio，也有用
+    image_size 装比例或 landscape_4_3 这类预设词的。
+    表缺失时不影响启动：仍可手填模型 ID，由试错逻辑兜底。
+    """
+    try:
+        from kie_models import KIE_IMAGE_MODELS
+    except Exception:
+        return {}
+
+    specs: dict[str, dict[str, Any]] = {}
+    for kie_model_id, raw in KIE_IMAGE_MODELS.items():
+        aspects = {
+            KIE_ASPECT_PRESET_TO_RATIO.get(value, value)
+            for value in (raw.get("aspects") or [])
+        }
+        specs[kie_model_id] = {
+            "label": f"{raw.get('label') or kie_model_id}（{kie_model_id}）",
+            "image_field": raw.get("image_field"),
+            "image_is_list": bool(raw.get("image_is_list")),
+            "max_references": int(raw.get("max_references") or 0),
+            "resolution_field": raw.get("resolution_field"),
+            "resolutions": set(raw.get("resolutions") or []),
+            "aspect_field": raw.get("aspect_field"),
+            "aspect_style": raw.get("aspect_style"),
+            "aspects": aspects,
+        }
+    return specs
+
+
+KIE_MODEL_SPECS: dict[str, dict[str, Any]] = _load_kie_model_specs()
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 LEGACY_APIYI_BASE_URL = "https://api.apiyi.com"
 GPT_IMAGE_2_VIP_MODEL_ID = "gpt-image-2-vip"
@@ -371,7 +370,7 @@ MODEL_OPTIONS.extend(
         "short_name": kie_model_id,
         # 没有 resolution 参数的模型（如 Lite）只当作原生 1K，选 2K 时会给出提示。
         "native_sizes": set(spec["resolutions"]) or {"1K"},
-        "native_aspects": set(spec["aspects"]),
+        "native_aspects": set(spec["aspects"]) or set(ASPECT_RATIO_CHOICES[1:]),
         "supports_google_search": False,
         "supports_image_search": False,
         "supports_quality": False,
@@ -2055,8 +2054,12 @@ def kie_model_spec(model_id: str) -> dict[str, Any]:
     inferred: dict[str, Any] = {
         "label": clean,
         "image_field": guessed_field,
+        "image_is_list": True,
         "max_references": 10,
+        "resolution_field": "resolution",
         "resolutions": {"1K", "2K", "4K"},
+        "aspect_field": "aspect_ratio",
+        "aspect_style": "ratio",
         "aspects": set(GPT_IMAGE_2_VIP_SIZES["2K"].keys()),
         "split_task_model": split_task_model,
         "inferred": True,
@@ -2072,17 +2075,37 @@ def kie_model_spec(model_id: str) -> dict[str, Any]:
     return inferred
 
 
-def kie_task_model_id(model_id: str, has_references: bool) -> str:
-    """GPT Image 2.5 把文生图和图生图拆成两个模型 ID，这里按有无参考图选择。"""
+def kie_sibling_model(model_id: str, want_references: bool) -> str | None:
+    """找同系列里对应文生图 / 图生图的另一个模型 ID。
+
+    kie.ai 上多数厂商把两者拆成独立模型（如 qwen3/text-to-image 与
+    qwen3/image-to-image），选错了就换成配对的那个。
+    """
+    pairs = [("text-to-image", "image-to-image"), ("text-to-image", "image-edit"),
+             ("text-to-image", "edit")]
+    for text_name, image_name in pairs:
+        source, target = (text_name, image_name) if want_references else (image_name, text_name)
+        if source in model_id:
+            candidate = model_id.replace(source, target)
+            spec = KIE_MODEL_SPECS.get(candidate)
+            if spec and bool(spec.get("image_field")) == want_references:
+                return candidate
+    return None
+
+
+def kie_resolve_task_model(model_id: str, has_references: bool) -> tuple[str, dict[str, Any], str | None]:
+    """确定实际要调用的模型，必要时切到配对模型；返回 (模型 ID, 参数表, 说明)。"""
     spec = kie_model_spec(model_id)
-    explicit = spec.get("image_to_image_model" if has_references else "text_to_image_model")
-    if explicit:
-        return str(explicit)
-    if spec.get("split_task_model"):
-        suffix = KIE_TASK_MODEL_SUFFIXES[bool(has_references)]
-        if not model_id.endswith(suffix):
-            return f"{model_id}{suffix}"
-    return model_id
+    supports_references = bool(spec.get("image_field"))
+    if has_references == supports_references or spec.get("inferred"):
+        return model_id, spec, None
+    sibling = kie_sibling_model(model_id, has_references)
+    if sibling:
+        kind = "图生图" if has_references else "文生图"
+        return sibling, kie_model_spec(sibling), f"`{model_id}` 不能做{kind}，已自动改用 `{sibling}`。"
+    if has_references:
+        raise ValueError(f"`{model_id}` 只支持文生图，请去掉参考图，或选择该系列的图生图模型。")
+    raise ValueError(f"`{model_id}` 需要参考图，请上传参考图，或选择该系列的文生图模型。")
 
 
 def kie_adjust_after_error(
@@ -2242,15 +2265,15 @@ def generate_kie_image(
     keep_alpha: bool = False,
 ) -> tuple[Image.Image, str | None]:
     """走 kie.ai 的异步任务：上传参考图 → 建任务 → 轮询 → 下载结果。"""
-    spec = kie_model_spec(model_id)
     references = list(reference_paths or [])
-    max_references = int(spec.get("max_references") or 10)
+    task_model, spec, switch_note = kie_resolve_task_model(model_id, bool(references))
+    max_references = int(spec.get("max_references") or 10) or 1
     if len(references) > max_references:
         raise ValueError(
-            f"`{model_id}` 最多支持 {max_references} 张参考图，当前有 {len(references)} 张。"
+            f"`{task_model}` 最多支持 {max_references} 张参考图，当前有 {len(references)} 张。"
         )
 
-    notes: list[str] = []
+    notes: list[str] = [switch_note] if switch_note else []
     with make_httpx_client(proxy_url) as client:
         reference_urls: list[str] = []
         if references:
@@ -2258,28 +2281,48 @@ def generate_kie_image(
             if upload_note:
                 notes.append(upload_note)
 
-        image_field = str(spec["image_field"])
-        task_model = kie_task_model_id(model_id, bool(references))
+        image_field = str(spec.get("image_field") or "image_input")
+        resolution_field = spec.get("resolution_field") or "resolution"
         send_resolution = resolution in set(spec.get("resolutions") or set())
         if not send_resolution and resolution not in {"512", "1K"} and not spec.get("inferred"):
+            supported = sorted(spec.get("resolutions") or set())
             notes.append(
-                f"`{model_id}` 没有分辨率参数，`{resolution}` 不会生效，实际会按该模型的默认尺寸出图。"
+                f"`{task_model}` "
+                + (f"只支持 {'/'.join(supported)}" if supported else "没有分辨率参数")
+                + f"，`{resolution}` 不会生效，实际按该模型的默认尺寸出图。"
             )
+
+        # 画幅参数各模型名字和写法都不同：有的叫 aspect_ratio，有的用 image_size
+        # 装比例，还有的用 landscape_4_3 这类预设词。
+        aspect_field = spec.get("aspect_field")
+        aspect_value: Any = None
+        if aspect_field:
+            if api_aspect_ratio and spec.get("aspect_style") == "preset":
+                aspect_value = next(
+                    (word for word, ratio in KIE_ASPECT_PRESET_TO_RATIO.items()
+                     if ratio == api_aspect_ratio), None
+                )
+            elif api_aspect_ratio:
+                aspect_value = api_aspect_ratio
+            elif spec.get("aspect_style") != "preset":
+                # 省略该字段时部分模型会默认 1:1 而不是自适应，所以显式传 auto。
+                aspect_value = "auto"
 
         # 未登记的模型可能用别的字段名或拆分模型 ID，按报错逐步纠正，成功后记住。
         initial = (image_field, send_resolution, task_model)
         tried_fields = {image_field}
         task_id = ""
         for attempt in range(4):
-            task_input: dict[str, Any] = {
-                "prompt": prompt,
-                # 省略该字段时部分模型会默认 1:1 而不是自适应，所以显式传 auto。
-                "aspect_ratio": api_aspect_ratio or "auto",
-            }
+            task_input: dict[str, Any] = {"prompt": prompt}
+            if aspect_field and aspect_value is not None:
+                task_input[str(aspect_field)] = aspect_value
             if reference_urls:
-                task_input[image_field] = reference_urls
+                # 少数模型的参考图字段是单个字符串而不是数组（如 qwen/image-to-image）。
+                task_input[image_field] = (
+                    reference_urls if spec.get("image_is_list", True) else reference_urls[0]
+                )
             if send_resolution:
-                task_input["resolution"] = resolution
+                task_input[str(resolution_field)] = resolution
             try:
                 created = kie_unwrap(
                     parse_json_response(

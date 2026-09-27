@@ -87,6 +87,7 @@ jobs:
             --icon GeminiImageTool.icns \
             --collect-all gradio \
             --collect-all gradio_client \
+            --hidden-import kie_models \
             --collect-all safehttpx \
             --collect-all groovy \
             --copy-metadata gradio \
