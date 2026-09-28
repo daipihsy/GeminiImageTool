@@ -78,6 +78,16 @@ GENAI_BASE64_PATCHED = patch_genai_standard_base64()
 # 基础路径与运行配置。
 SOURCE_DIR = Path(__file__).resolve().parent
 
+try:
+    from _build_info import APP_VERSION
+except Exception:
+    APP_VERSION = "dev"
+APP_NAME = "AI 本地图像生成工具"
+# 版本号写进页面标题：既能在浏览器标签上看到，也用来识别已在运行的实例是不是同一版本。
+APP_TITLE = APP_NAME if APP_VERSION == "dev" else f"{APP_NAME} {APP_VERSION}"
+# 已有实例的探测范围，与 resolve_server_port 的顺延范围一致。
+INSTANCE_PORT_SPAN = 20
+
 
 def _dir_is_writable(path: Path) -> bool:
     """检测目录是否可写（macOS 拖进 /Applications 后为只读）。"""
@@ -5938,7 +5948,7 @@ def build_demo() -> gr.Blocks:
     )
     settings_open = not bool(initial_api_key)
 
-    with gr.Blocks(title="AI 本地图像生成工具", fill_width=True) as demo:
+    with gr.Blocks(title=APP_TITLE, fill_width=True) as demo:
         conversations_state = gr.State(conversations)
         current_conversation_id = gr.State(initial_conversation["id"])
         batch_visible_rows_state = gr.State(INITIAL_BATCH_ROWS)
@@ -6017,6 +6027,16 @@ def build_demo() -> gr.Blocks:
                     f"协议必须与中转站文档一致。Base URL 可填根域名或 `/v1` 地址；例如旧版 APIYI 地址 `{LEGACY_APIYI_BASE_URL}` 仍可继续使用。生成失败不会自动重试，避免重复扣费。",
                     elem_classes=["muted-note"],
                 )
+                # 放在设置面板最底部、用小按钮，避免误触；点击后还会弹确认框。
+                with gr.Row(equal_height=True):
+                    gr.Markdown(
+                        "关闭浏览器不会结束程序，后台服务仍在运行。需要彻底关闭时点右侧按钮。",
+                        elem_classes=["muted-note"],
+                    )
+                    quit_button = gr.Button(
+                        "彻底退出程序", variant="secondary", size="sm", scale=0, min_width=120
+                    )
+                    quit_confirm_box = gr.Checkbox(value=False, visible=False)
 
             page_selector = gr.Radio(
                 label="工作模式",
@@ -6986,6 +7006,14 @@ def build_demo() -> gr.Blocks:
                 reference_selected_index_state,
             ],
         )
+        # js 的返回值会替换后端函数的入参：点「取消」时后端仍会被调用、只是收到 False，
+        # 所以由后端判断是否真的退出。确认后先盖一层提示，避免页面停在断线报错上。
+        quit_button.click(
+            fn=shutdown_app_handler,
+            inputs=[quit_confirm_box],
+            js=QUIT_CONFIRM_JS,
+        )
+
         _gen_event = generate_button.click(
             fn=generate_or_unlock_batch_handler,
             inputs=[
@@ -7110,6 +7138,75 @@ def build_demo() -> gr.Blocks:
     return demo
 
 
+QUIT_CONFIRM_JS = """
+(_) => {
+  const ok = window.confirm(
+    "确定要彻底退出程序吗？\\n\\n后台服务会被关闭，正在进行的生成会中断。\\n下次使用请重新打开程序。"
+  );
+  if (ok) {
+    const cover = document.createElement("div");
+    cover.style.cssText = "position:fixed;inset:0;z-index:99999;display:flex;align-items:center;" +
+      "justify-content:center;flex-direction:column;gap:12px;background:#fbf6ef;" +
+      "font-family:system-ui,sans-serif;color:#3a2d20;";
+    cover.innerHTML = "<div style='font-size:26px;font-weight:600'>程序已彻底退出</div>" +
+      "<div style='font-size:15px;opacity:.75'>后台服务已关闭，可以直接关闭这个页面。</div>";
+    document.body.appendChild(cover);
+  }
+  return [ok];
+}
+"""
+
+
+def shutdown_app_handler(confirmed: bool) -> None:
+    """彻底结束后台进程。
+
+    关掉浏览器只是关了页面，本地服务仍在后台运行；再次打开又会起一个新实例，
+    越开越多占内存。这里在用户确认后结束整个进程。稍作延迟，让本次请求先正常返回。
+    用 os._exit 而不是 demo.close()：后者不一定能收掉 uvicorn 等后台线程。
+    """
+    if not confirmed:
+        return
+    print("[退出] 用户在页面上选择了彻底退出程序。")
+    timer = threading.Timer(0.8, lambda: os._exit(0))
+    timer.daemon = True
+    timer.start()
+
+
+def preferred_server_port(default_port: int = 7860) -> int:
+    """首选端口：可用环境变量 GRADIO_SERVER_PORT 覆盖。"""
+    env_port = os.getenv("GRADIO_SERVER_PORT", "").strip()
+    try:
+        return int(env_port) if env_port else default_port
+    except ValueError:
+        return default_port
+
+
+def find_running_instance() -> tuple[str | None, str | None]:
+    """查找本机上已在运行的本程序。
+
+    返回 (同版本实例地址, 其它版本实例的标题)。按 Gradio /config 里的页面标题识别，
+    不会误认别的 Gradio 应用；只有版本号完全一致才复用，否则升级后再启动会被
+    带回旧版本。
+    """
+    other_version: str | None = None
+    start = preferred_server_port()
+    for port in range(start, start + INSTANCE_PORT_SPAN):
+        if is_port_available(port):
+            continue
+        url = f"http://127.0.0.1:{port}"
+        try:
+            with httpx.Client(timeout=1.5, trust_env=False) as client:
+                response = client.get(f"{url}/config")
+            title = str(response.json().get("title") or "") if response.status_code == 200 else ""
+        except Exception:
+            continue
+        if title == APP_TITLE:
+            return url, None
+        if title.startswith(APP_NAME):
+            other_version = title
+    return None, other_version
+
+
 def open_browser_after_delay(url: str, delay_seconds: float = 2.0) -> None:
     """延迟打开浏览器，避免服务未就绪时打开空白页。"""
     timer = threading.Timer(delay_seconds, lambda: webbrowser.open(url))
@@ -7130,13 +7227,9 @@ def is_port_available(port: int) -> bool:
 
 def resolve_server_port(default_port: int = 7860) -> int:
     """优先使用默认端口；若被占用，则自动回退到下一个可用端口。"""
-    env_port = os.getenv("GRADIO_SERVER_PORT", "").strip()
-    try:
-        preferred_port = int(env_port) if env_port else default_port
-    except ValueError:
-        preferred_port = default_port
+    preferred_port = preferred_server_port(default_port)
 
-    for candidate in range(preferred_port, preferred_port + 20):
+    for candidate in range(preferred_port, preferred_port + INSTANCE_PORT_SPAN):
         if is_port_available(candidate):
             if candidate != preferred_port:
                 print(f"[启动提示] 端口 {preferred_port} 已占用，已自动切换到 {candidate}。")
@@ -7154,6 +7247,18 @@ def launch_app(auto_open_browser: bool = False) -> None:
     # 某些代理环境会错误转发 127.0.0.1，自检时显式排除本地回环。
     os.environ["NO_PROXY"] = "127.0.0.1,localhost"
     os.environ["no_proxy"] = "127.0.0.1,localhost"
+    if auto_open_browser:
+        existing_url, other_version = find_running_instance()
+        if existing_url:
+            # 已经在跑同一个版本：直接打开它，不再多开一个占内存的实例。
+            print(f"[启动提示] 程序已在运行：{existing_url}，直接打开，不重复启动。")
+            webbrowser.open(existing_url)
+            return
+        if other_version:
+            print(
+                f"[启动提示] 检测到另一个版本（{other_version}）仍在运行，本次按新版本启动。"
+                "旧版本可在其页面上点“彻底退出程序”关闭（v2.5.2 之前的版本没有该按钮，需重启电脑或在任务管理器中结束）。"
+            )
     server_port = resolve_server_port()
     app_url = f"http://127.0.0.1:{server_port}"
     if auto_open_browser:
