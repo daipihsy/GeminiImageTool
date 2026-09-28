@@ -6027,19 +6027,24 @@ def build_demo() -> gr.Blocks:
                     f"协议必须与中转站文档一致。Base URL 可填根域名或 `/v1` 地址；例如旧版 APIYI 地址 `{LEGACY_APIYI_BASE_URL}` 仍可继续使用。生成失败不会自动重试，避免重复扣费。",
                     elem_classes=["muted-note"],
                 )
-
-            with gr.Row(equal_height=True):
-                page_selector = gr.Radio(
-                    label="工作模式",
-                    choices=["创作工作台", "图片编辑"],
-                    value="创作工作台",
-                    visible=True,
-                    elem_classes=["page-switcher"],
-                    scale=6,
-                )
-                with gr.Column(scale=1, min_width=150):
-                    quit_button = gr.Button("彻底退出程序", variant="stop", size="sm")
+                # 放在设置面板最底部、用小按钮，避免误触；点击后还会弹确认框。
+                with gr.Row(equal_height=True):
+                    gr.Markdown(
+                        "关闭浏览器不会结束程序，后台服务仍在运行。需要彻底关闭时点右侧按钮。",
+                        elem_classes=["muted-note"],
+                    )
+                    quit_button = gr.Button(
+                        "彻底退出程序", variant="secondary", size="sm", scale=0, min_width=120
+                    )
                     quit_confirm_box = gr.Checkbox(value=False, visible=False)
+
+            page_selector = gr.Radio(
+                label="工作模式",
+                choices=["创作工作台", "图片编辑"],
+                value="创作工作台",
+                visible=True,
+                elem_classes=["page-switcher"],
+            )
 
             with gr.Row(visible=True, elem_classes=["workspace-shell"]) as creative_page:
                 with gr.Column(scale=4, min_width=720, elem_classes=["main-panel"]):
