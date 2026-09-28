@@ -68,6 +68,13 @@ jobs:
           "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PUBLISH_RELEASE=$publish" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Write build version
+        shell: pwsh
+        run: |
+          # 写入版本号：显示在页面标题上，也用于识别已在运行的实例是否为同一版本。
+          "APP_VERSION = `"$env:RELEASE_TAG`"" | Out-File -FilePath _build_info.py -Encoding utf8
+          Get-Content _build_info.py
+
       - name: Build branded Windows app
         shell: pwsh
         run: |
@@ -76,6 +83,7 @@ jobs:
             --collect-all gradio `
             --collect-all gradio_client `
             --hidden-import kie_models `
+            --hidden-import _build_info `
             --collect-all safehttpx `
             --collect-all groovy `
             --copy-metadata gradio `

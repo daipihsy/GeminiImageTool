@@ -66,6 +66,12 @@ jobs:
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "PUBLISH_RELEASE=$PUBLISH" >> "$GITHUB_ENV"
 
+      - name: Write build version
+        run: |
+          # 写入版本号：显示在页面标题上，也用于识别已在运行的实例是否为同一版本。
+          echo "APP_VERSION = \"${RELEASE_TAG}\"" > _build_info.py
+          cat _build_info.py
+
       - name: Build macOS app icon
         run: |
           mkdir -p GeminiImageTool.iconset
@@ -88,6 +94,7 @@ jobs:
             --collect-all gradio \
             --collect-all gradio_client \
             --hidden-import kie_models \
+            --hidden-import _build_info \
             --collect-all safehttpx \
             --collect-all groovy \
             --copy-metadata gradio \
