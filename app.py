@@ -35,6 +35,8 @@ from PIL import Image, ImageDraw, ImageFont
 from google import genai
 from google.genai import types
 
+from app_lifecycle import BrowserLifecycle, InstanceLock
+
 
 def patch_genai_standard_base64() -> bool:
     """让 google-genai 用标准 base64 发送 inlineData，兼容严格解码的中转站。
@@ -5939,11 +5941,15 @@ def build_demo() -> gr.Blocks:
     settings_open = not bool(initial_api_key)
 
     with gr.Blocks(title="AI 本地图像生成工具", fill_width=True) as demo:
+        lifecycle = BrowserLifecycle(lambda: demo.close(verbose=False))
         conversations_state = gr.State(conversations)
         current_conversation_id = gr.State(initial_conversation["id"])
         batch_visible_rows_state = gr.State(INITIAL_BATCH_ROWS)
 
         with gr.Column(elem_classes=["app-shell"]):
+            with gr.Row():
+                gr.Markdown("关闭最后一个程序网页后，后台服务会自动退出。")
+                exit_button = gr.Button("退出程序", variant="secondary", scale=0)
             with gr.Accordion("设置", open=settings_open, elem_classes=["settings-wrap"]):
                 with gr.Row():
                     api_protocol_dropdown = gr.Dropdown(
@@ -7107,6 +7113,10 @@ def build_demo() -> gr.Blocks:
             outputs=[edit_wm_status, edit_wm_result, edit_wm_download],
         )
 
+        demo.load(fn=lifecycle.opened, queue=False, show_progress="hidden")
+        demo.unload(lifecycle.closed)
+        exit_button.click(fn=lifecycle.request_exit, queue=False, show_progress="hidden")
+
     return demo
 
 
@@ -7154,18 +7164,33 @@ def launch_app(auto_open_browser: bool = False) -> None:
     # 某些代理环境会错误转发 127.0.0.1，自检时显式排除本地回环。
     os.environ["NO_PROXY"] = "127.0.0.1,localhost"
     os.environ["no_proxy"] = "127.0.0.1,localhost"
-    server_port = resolve_server_port()
-    app_url = f"http://127.0.0.1:{server_port}"
-    if auto_open_browser:
-        open_browser_after_delay(app_url)
+    instance = InstanceLock(BASE_DIR)
+    if not instance.acquire():
+        existing_url = instance.wait_for_url()
+        if existing_url and auto_open_browser:
+            webbrowser.open(existing_url)
+        return
 
-    demo = build_demo()
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=server_port,
-        allowed_paths=build_allowed_launch_paths(),
-        css=APP_CSS,
-    )
+    demo = None
+    try:
+        server_port = resolve_server_port()
+        demo = build_demo()
+        demo.launch(
+            server_name="127.0.0.1",
+            server_port=server_port,
+            allowed_paths=build_allowed_launch_paths(),
+            css=APP_CSS,
+            prevent_thread_lock=True,
+        )
+        app_url = demo.local_url or f"http://127.0.0.1:{server_port}"
+        instance.publish(app_url)
+        if auto_open_browser:
+            open_browser_after_delay(app_url, delay_seconds=0.5)
+        demo.block_thread()
+    finally:
+        if demo is not None:
+            demo.close(verbose=False)
+        instance.release()
 
 
 if __name__ == "__main__":

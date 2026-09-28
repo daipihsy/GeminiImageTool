@@ -18,7 +18,7 @@
 以下步骤保留给需要内置便携 Python 目录的本地打包方式：
 
 1. 装 [Inno Setup 6](https://jrsoftware.org/isdl.php)。
-2. 准备一个**干净的完整便携目录**（含 `python/` + `app.py` + 支持文件，不含 `data/config.json`、`outputs/`、`__pycache__`、`unins000.*`、`*.bak`）。
+2. 准备一个**干净的完整便携目录**（含 `python/` + `app.py` + `app_lifecycle.py` + 支持文件，不含 `data/config.json`、`outputs/`、`__pycache__`、`unins000.*`、`*.bak`）。
 3. 编辑 `packaging/GeminiImageTool.iss`，把 `StageDir` 指向该目录。
 4. 编译：`ISCC.exe packaging\GeminiImageTool.iss` → 生成 `GeminiImageTool_Setup_v<版本>.exe`。
 

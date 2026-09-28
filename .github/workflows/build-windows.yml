@@ -12,6 +12,7 @@ on:
     tags: ['v*']
     paths:
       - "app.py"
+      - "app_lifecycle.py"
       - "requirements.txt"
       - "assets/**"
       - "packaging/GeminiImageTool-PyInstaller.iss"
@@ -19,6 +20,7 @@ on:
   pull_request:
     paths:
       - "app.py"
+      - "app_lifecycle.py"
       - "requirements.txt"
       - "assets/**"
       - "packaging/GeminiImageTool-PyInstaller.iss"
@@ -76,6 +78,7 @@ jobs:
             --collect-all gradio `
             --collect-all gradio_client `
             --hidden-import kie_models `
+            --hidden-import socksio `
             --collect-all safehttpx `
             --collect-all groovy `
             --copy-metadata gradio `
