@@ -4847,6 +4847,68 @@ def clear_batch_reference_images_handler() -> tuple[Any, Any, list[str], str]:
     )
 
 
+SHARED_REFERENCE_POSITION_FIRST = "放在每行参考图前面"
+SHARED_REFERENCE_POSITION_LAST = "放在每行参考图后面"
+SHARED_REFERENCE_POSITION_CHOICES = [SHARED_REFERENCE_POSITION_FIRST, SHARED_REFERENCE_POSITION_LAST]
+
+
+def build_batch_shared_reference_hint(file_paths: list[str] | None = None) -> str:
+    """批量页统一参考图提示。"""
+    paths = file_paths or []
+    if not paths:
+        return "未添加统一参考图。这里的图会附加到每一个有内容的批次，适合放所有图都要参考的产品、人物或风格图。"
+    return (
+        f"已添加 {len(paths)} 张统一参考图，会附加到每一个有内容的批次；"
+        f"与本行参考图合计最多 {MAX_REFERENCE_IMAGES} 张。"
+    )
+
+
+def append_batch_shared_reference_images_handler(
+    new_image_paths: Any,
+    current_paths: list[str] | None,
+) -> tuple[Any, Any, list[str], str]:
+    """统一参考图追加规则与每行一致，只换提示文案。"""
+    files_update, gallery_update, paths, _hint = append_batch_reference_images_handler(
+        new_image_paths, current_paths
+    )
+    return files_update, gallery_update, paths, build_batch_shared_reference_hint(paths)
+
+
+def clear_batch_shared_reference_images_handler() -> tuple[Any, Any, list[str], str]:
+    """清空统一参考图。"""
+    return (
+        gr.update(value=None),
+        gr.update(value=[], visible=False),
+        [],
+        build_batch_shared_reference_hint([]),
+    )
+
+
+def combine_batch_reference_paths(
+    shared_paths: list[str],
+    row_paths: list[str],
+    shared_position: str | None,
+) -> list[str]:
+    """按用户选择的顺序把统一参考图和本行参考图拼在一起。"""
+    if shared_position == SHARED_REFERENCE_POSITION_LAST:
+        return [*row_paths, *shared_paths]
+    return [*shared_paths, *row_paths]
+
+
+def describe_batch_task_references(task: dict[str, Any]) -> str:
+    """队列表格和结果说明里的参考图数量，区分统一参考图和本行参考图。"""
+    total_count = len(task["reference_paths"])
+    shared_count = int(task.get("shared_reference_count") or 0)
+    row_count = total_count - shared_count
+    if not total_count:
+        return "无（文生图）"
+    if shared_count and row_count:
+        return f"统一 {shared_count} + 本行 {row_count} 张"
+    if shared_count:
+        return f"统一 {shared_count} 张"
+    return f"{row_count} 张"
+
+
 def merge_batch_prompt(prompt: str, global_prompt_suffix: str | None) -> str:
     """把单行 Prompt 和批次统一要求合并。"""
     clean_prompt = (prompt or "").strip()
@@ -4859,10 +4921,19 @@ def merge_batch_prompt(prompt: str, global_prompt_suffix: str | None) -> str:
 def collect_batch_tasks(
     row_values: tuple[Any, ...],
     global_prompt_suffix: str | None = None,
+    shared_reference_paths: Any = None,
+    shared_reference_position: str | None = SHARED_REFERENCE_POSITION_FIRST,
 ) -> list[dict[str, Any]]:
-    """从固定任务表里收集有效行；空行自动跳过。"""
+    """从固定任务表里收集有效行；空行自动跳过。
+
+    统一参考图会附加到每一个有内容的行，但它本身不会让空行变成任务。
+    """
     if len(row_values) % MAX_BATCH_ROW_INPUT_SIZE != 0:
         raise ValueError("批量任务表参数数量异常，请刷新页面后再试。")
+
+    shared_paths = normalize_uploaded_reference_paths(shared_reference_paths)
+    if len(shared_paths) > MAX_REFERENCE_IMAGES:
+        raise ValueError(f"统一参考图最多 {MAX_REFERENCE_IMAGES} 张，请删减后再生成。")
 
     tasks: list[dict[str, Any]] = []
     clean_global_suffix = (global_prompt_suffix or "").strip()
@@ -4882,11 +4953,19 @@ def collect_batch_tasks(
             seed_value,
         ) = row_values[offset : offset + MAX_BATCH_ROW_INPUT_SIZE]
 
-        reference_paths = normalize_uploaded_reference_paths(reference_value)
+        row_reference_paths = normalize_uploaded_reference_paths(reference_value)
         clean_prompt = (prompt_value or "").strip()
-        if not clean_prompt and not reference_paths:
+        if not clean_prompt and not row_reference_paths:
             continue
+        reference_paths = combine_batch_reference_paths(
+            shared_paths, row_reference_paths, shared_reference_position
+        )
         if len(reference_paths) > MAX_REFERENCE_IMAGES:
+            if shared_paths:
+                raise ValueError(
+                    f"第 {row_index} 行：统一参考图 {len(shared_paths)} 张 + 本行 {len(row_reference_paths)} 张，"
+                    f"超过 {MAX_REFERENCE_IMAGES} 张上限，请删减后再生成。"
+                )
             raise ValueError(f"第 {row_index} 行最多上传 {MAX_REFERENCE_IMAGES} 张参考图，请删减后再生成。")
 
         prompt_source = "用户输入"
@@ -4900,6 +4979,7 @@ def collect_batch_tasks(
         task = {
             "row_index": row_index,
             "reference_paths": reference_paths,
+            "shared_reference_count": len(shared_paths),
             "prompt": final_prompt,
             "row_prompt": clean_prompt,
             "global_prompt_suffix": clean_global_suffix,
@@ -4917,6 +4997,8 @@ def collect_batch_tasks(
         tasks.append(task)
 
     if not tasks:
+        if shared_paths:
+            raise ValueError("请至少填写一行任务：统一参考图需要配合至少一行 Prompt 或本行参考图使用。")
         raise ValueError("请至少填写一行任务：上传参考图或输入 Prompt 都可以。")
     if len(tasks) > MAX_BATCH_ROWS:
         raise ValueError(f"单个批次最多支持 {MAX_BATCH_ROWS} 行任务。")
@@ -4952,7 +5034,7 @@ def build_batch_task_rows(tasks: list[dict[str, Any]], status: str) -> list[list
             [
                 task["row_index"],
                 status,
-                f"{len(task['reference_paths'])} 张" if task["reference_paths"] else "无（文生图）",
+                describe_batch_task_references(task),
                 compact_table_text(task["prompt"]),
                 f"0/{task['images_per_prompt']}",
                 note,
@@ -4963,11 +5045,15 @@ def build_batch_task_rows(tasks: list[dict[str, Any]], status: str) -> list[list
 
 def preview_batch_tasks_handler(
     global_prompt_suffix: str,
+    shared_reference_paths: list[str] | None,
+    shared_reference_position: str,
     *row_values: Any,
 ) -> tuple[list[list[Any]], str]:
     """生成前预览有效任务，降低误跑大批次的风险。"""
     try:
-        tasks = collect_batch_tasks(row_values, global_prompt_suffix)
+        tasks = collect_batch_tasks(
+            row_values, global_prompt_suffix, shared_reference_paths, shared_reference_position
+        )
     except ValueError as exc:
         return [], f"预览未通过：{exc}"
 
@@ -4979,6 +5065,9 @@ def preview_batch_tasks_handler(
         f"其中图生图 **{image_to_image_count}** 行、文生图 **{text_to_image_count}** 行，"
         f"预计生成 **{total_images}** 张图。确认无误后点击“开始批量生成”。"
     )
+    shared_count = int(tasks[0].get("shared_reference_count") or 0)
+    if shared_count:
+        status = f"{status}\n\n每行都会附带 **{shared_count}** 张统一参考图（{shared_reference_position}）。"
     return build_batch_task_rows(tasks, "已识别"), status
 
 
@@ -5039,6 +5128,8 @@ def clear_batch_table_handler(api_protocol: str) -> tuple[Any, ...]:
 
     return (
         gr.update(value=""),
+        *clear_batch_shared_reference_images_handler(),
+        gr.update(value=SHARED_REFERENCE_POSITION_FIRST),
         *row_updates,
         INITIAL_BATCH_ROWS,
         *build_batch_row_visibility_updates(INITIAL_BATCH_ROWS),
@@ -5112,6 +5203,7 @@ def build_batch_manifest(
                 "prompt": task["prompt"],
                 "prompt_source": task["prompt_source"],
                 "reference_paths": task["reference_paths"],
+                "shared_reference_count": task.get("shared_reference_count", 0),
                 "model_id": task["model_id"],
                 "aspect_ratio": task["aspect_ratio"],
                 "resolution": task["resolution"],
@@ -5131,6 +5223,60 @@ def build_batch_manifest(
     }
 
 
+# 批量生图的取消：按浏览器会话登记正在跑的批次。点「取消生成」只置位标记，
+# 生成循环在每张图发请求前检查。已经发出的请求（包括 kie.ai 已提交、已计费的任务）
+# 照常等它返回并保存，之后的图不再请求，避免继续消耗 Token。
+# 不用 Gradio 的 cancels：它要等当前请求返回才真正生效，而且一行内多张图之间没有 yield，
+# 会把整行剩下的图都跑完才停。
+_BATCH_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_BATCH_CANCEL_LOCK = threading.Lock()
+BATCH_ROW_UNFINISHED_STATUSES = ("待生成", "生成中")
+
+
+def batch_session_key(request: gr.Request | None) -> str:
+    """同一个浏览器页面的批量任务共用一个取消标记。"""
+    return getattr(request, "session_hash", None) or "local"
+
+
+def register_batch_run(session_key: str) -> threading.Event:
+    """登记新批次；同一会话的旧标记直接被替换，旧线程仍持有自己那份。"""
+    cancel_event = threading.Event()
+    with _BATCH_CANCEL_LOCK:
+        _BATCH_CANCEL_EVENTS[session_key] = cancel_event
+    return cancel_event
+
+
+def unregister_batch_run(session_key: str, cancel_event: threading.Event) -> None:
+    """批次结束后注销，只删自己登记的那份，避免误删同会话的新批次。"""
+    with _BATCH_CANCEL_LOCK:
+        if _BATCH_CANCEL_EVENTS.get(session_key) is cancel_event:
+            del _BATCH_CANCEL_EVENTS[session_key]
+
+
+def cancel_batch_generate_handler(request: gr.Request) -> Any:
+    """「取消生成」按钮：请求停止当前会话正在跑的批量任务。"""
+    with _BATCH_CANCEL_LOCK:
+        cancel_event = _BATCH_CANCEL_EVENTS.get(batch_session_key(request))
+    if cancel_event is None:
+        gr.Info("当前没有正在运行的批量任务。")
+        return gr.update()
+    if cancel_event.is_set():
+        gr.Info("已经在取消了，正在等当前这张图返回。")
+        return gr.update()
+    cancel_event.set()
+    gr.Info("已收到取消，不会再发起新的请求。")
+    return (
+        "**正在取消批量生成**：不会再发起新的请求；已经发出的这张图会等它返回并保存，随后停止。"
+    )
+
+
+def mark_unfinished_batch_rows(rows: list[list[Any]], status: str) -> None:
+    """把还没跑完的行统一标成已取消 / 未完成，表格和 manifest 都据此记录。"""
+    for row in rows:
+        if row[1] in BATCH_ROW_UNFINISHED_STATUSES:
+            row[1] = status
+
+
 def batch_generate_handler(
     api_key: str,
     proxy_url: str,
@@ -5139,6 +5285,10 @@ def batch_generate_handler(
     output_root: str,
     backup_root: str,
     global_prompt_suffix: str,
+    shared_reference_paths: list[str] | None,
+    shared_reference_position: str,
+    # gr.Request 只有写在 *row_values 之前才会被 Gradio 注入。
+    request: gr.Request,
     *row_values: Any,
     progress: gr.Progress = gr.Progress(track_tqdm=False),
 ):
@@ -5148,7 +5298,9 @@ def batch_generate_handler(
 
     try:
         protocol = normalize_api_protocol(api_protocol)
-        tasks = collect_batch_tasks(row_values, global_prompt_suffix)
+        tasks = collect_batch_tasks(
+            row_values, global_prompt_suffix, shared_reference_paths, shared_reference_position
+        )
         total_requested = sum(int(task["images_per_prompt"]) for task in tasks)
         output_root_path, backup_root_path = ensure_storage_roots(output_root, backup_root)
         final_batch_name = f"批量生图 {datetime.now().strftime('%m-%d %H:%M')}"
@@ -5176,277 +5328,301 @@ def batch_generate_handler(
     status_message = (
         f"批次 `{final_batch_name}` 已准备：{len(tasks)} 行任务，共 {total_requested} 张图。"
     )
-    yield (
-        gr.update(value=gallery_items),
-        clone_batch_rows(rows),
-        gr.update(value=[], visible=False),
-        gr.update(value=None, visible=False),
-        status_message,
-        folder_markdown,
-        gr.update(),
-    )
-
-    global_image_index = 0
-    for task_order, task in enumerate(tasks, start=1):
-        row_position = task_order - 1
-        prompt_index = int(task["row_index"])
-        prompt = task["prompt"]
-        per_prompt_count = int(task["images_per_prompt"])
-        rows[row_position][1] = "生成中"
-        rows[row_position][5] = ""
+    session_key = batch_session_key(request)
+    cancel_event = register_batch_run(session_key)
+    cancelled = False
+    try:
         yield (
             gr.update(value=gallery_items),
             clone_batch_rows(rows),
             gr.update(value=[], visible=False),
             gr.update(value=None, visible=False),
-            f"正在生成第 {task_order}/{len(tasks)} 行任务。",
+            status_message,
             folder_markdown,
             gr.update(),
         )
 
-        prompt_success_count = 0
-        last_error = ""
-        grounding_notes: list[str] = []
-        # 分辨率相关提示（协议不支持、自适应比例、参考图压缩、返回尺寸不符）统一写进本行“说明”，
-        # 不再每张图弹一次窗。
-        row_notes: list[str] = build_resolution_warnings(
-            protocol, task["aspect_ratio"], task["resolution"]
-        )
-        grounding_summary = "关闭"
-        try:
-            base_seed, _seed_locked = ensure_seed(task["keep_seed"], task["seed_value"])
-            reference_parts = (
-                prepare_reference_parts(task["reference_paths"])
-                if protocol == API_PROTOCOL_GEMINI
-                else []
+        global_image_index = 0
+        for task_order, task in enumerate(tasks, start=1):
+            if cancel_event.is_set():
+                cancelled = True
+                break
+            row_position = task_order - 1
+            prompt_index = int(task["row_index"])
+            prompt = task["prompt"]
+            per_prompt_count = int(task["images_per_prompt"])
+            rows[row_position][1] = "生成中"
+            rows[row_position][5] = ""
+            yield (
+                gr.update(value=gallery_items),
+                clone_batch_rows(rows),
+                gr.update(value=[], visible=False),
+                gr.update(value=None, visible=False),
+                f"正在生成第 {task_order}/{len(tasks)} 行任务。",
+                folder_markdown,
+                gr.update(),
             )
-            api_aspect_ratio, needs_ratio_postprocess = resolve_protocol_aspect_ratio(
-                protocol, task["model_id"], task["aspect_ratio"]
+
+            prompt_success_count = 0
+            last_error = ""
+            grounding_notes: list[str] = []
+            # 分辨率相关提示（协议不支持、自适应比例、参考图压缩、返回尺寸不符）统一写进本行“说明”，
+            # 不再每张图弹一次窗。
+            row_notes: list[str] = build_resolution_warnings(
+                protocol, task["aspect_ratio"], task["resolution"]
             )
-            api_image_size, needs_resize_postprocess = get_api_image_size(
-                task["model_id"], task["resolution"]
-            )
-            if protocol == API_PROTOCOL_GEMINI:
-                tools, actual_image_search_enabled, grounding_notes = build_grounding_tool(
-                    model_id=task["model_id"],
-                    enable_google_search=task["enable_google_search"],
-                    enable_image_search=task["enable_image_search"],
+            grounding_summary = "关闭"
+            try:
+                base_seed, _seed_locked = ensure_seed(task["keep_seed"], task["seed_value"])
+                reference_parts = (
+                    prepare_reference_parts(task["reference_paths"])
+                    if protocol == API_PROTOCOL_GEMINI
+                    else []
                 )
+                api_aspect_ratio, needs_ratio_postprocess = resolve_protocol_aspect_ratio(
+                    protocol, task["model_id"], task["aspect_ratio"]
+                )
+                api_image_size, needs_resize_postprocess = get_api_image_size(
+                    task["model_id"], task["resolution"]
+                )
+                if protocol == API_PROTOCOL_GEMINI:
+                    tools, actual_image_search_enabled, grounding_notes = build_grounding_tool(
+                        model_id=task["model_id"],
+                        enable_google_search=task["enable_google_search"],
+                        enable_image_search=task["enable_image_search"],
+                    )
+                else:
+                    tools, actual_image_search_enabled = None, False
+                    grounding_notes = []
+                actual_google_search_enabled = bool(tools)
+                grounding_summary = summarize_grounding_mode(
+                    actual_google_search_enabled, actual_image_search_enabled
+                )
+                effective_prompt = build_effective_prompt(
+                    prompt=prompt,
+                    needs_ratio_postprocess=needs_ratio_postprocess,
+                    aspect_ratio=task["aspect_ratio"],
+                )
+            except Exception as exc:
+                last_error = str(exc) if isinstance(exc, ValueError) else map_error_message(exc)
+                rows[row_position][1] = "失败"
+                rows[row_position][5] = last_error
+                yield (
+                    gr.update(value=gallery_items),
+                    clone_batch_rows(rows),
+                    gr.update(value=[str(path) for path in saved_primary_paths], visible=bool(saved_primary_paths)),
+                    gr.update(value=None, visible=False),
+                    f"第 {prompt_index} 行任务准备失败，已继续处理后续任务。",
+                    folder_markdown,
+                    gr.update(),
+                )
+                continue
+
+            for image_index in range(1, per_prompt_count + 1):
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
+                global_image_index += 1
+                image_seed = base_seed + image_index - 1
+                progress(
+                    global_image_index / max(1, total_requested),
+                    desc=f"批量生图：第 {task_order}/{len(tasks)} 行，图片 {image_index}/{per_prompt_count}",
+                )
+                request_start = perf_counter()
+                try:
+                    if protocol == API_PROTOCOL_OPENAI_IMAGES:
+                        image, size_mismatch_note = generate_openai_image(
+                            api_key=api_key,
+                            proxy_url=proxy_url,
+                            api_base_url=api_base_url,
+                            model_id=task["model_id"],
+                            prompt=effective_prompt,
+                            reference_paths=task["reference_paths"],
+                            resolution=task["resolution"],
+                            api_aspect_ratio=api_aspect_ratio,
+                            quality=task["quality"],
+                        )
+                        if size_mismatch_note and size_mismatch_note not in row_notes:
+                            row_notes.append(size_mismatch_note)
+                    elif protocol == API_PROTOCOL_KIE:
+                        image, kie_note = generate_kie_image(
+                            api_key=api_key,
+                            proxy_url=proxy_url,
+                            api_base_url=api_base_url,
+                            model_id=task["model_id"],
+                            prompt=effective_prompt,
+                            reference_paths=task["reference_paths"],
+                            resolution=task["resolution"],
+                            api_aspect_ratio=api_aspect_ratio,
+                        )
+                        if kie_note and kie_note not in row_notes:
+                            row_notes.append(kie_note)
+                    elif protocol == API_PROTOCOL_OPENAI_CHAT:
+                        image = generate_openai_chat_image(
+                            api_key=api_key,
+                            proxy_url=proxy_url,
+                            api_base_url=api_base_url,
+                            model_id=task["model_id"],
+                            prompt=effective_prompt,
+                            reference_paths=task["reference_paths"],
+                        )
+                    else:
+                        config_kwargs: dict[str, Any] = {
+                            "response_modalities": ["Image"],
+                            "seed": image_seed,
+                            "candidate_count": 1,
+                            "http_options": make_request_http_options(api_base_url),
+                        }
+                        if tools:
+                            config_kwargs["tools"] = tools
+                        if api_aspect_ratio:
+                            config_kwargs["image_config"] = types.ImageConfig(
+                                aspect_ratio=api_aspect_ratio,
+                                image_size=api_image_size,
+                            )
+                        else:
+                            config_kwargs["image_config"] = types.ImageConfig(image_size=api_image_size)
+
+                        if client is None:
+                            raise RuntimeError("Gemini 客户端未初始化。")
+                        response = client.models.generate_content(
+                            model=task["model_id"],
+                            contents=types.Content(
+                                role="user",
+                                parts=[types.Part.from_text(text=effective_prompt), *reference_parts],
+                            ),
+                            config=types.GenerateContentConfig(**config_kwargs),
+                        )
+                        image = extract_first_image(response)
+                    image = postprocess_image(
+                        image=image,
+                        requested_aspect_ratio=task["aspect_ratio"],
+                        requested_resolution=task["resolution"],
+                        needs_ratio_postprocess=needs_ratio_postprocess,
+                        needs_resize_postprocess=needs_resize_postprocess,
+                    )
+                    primary_path, backup_path = save_batch_image_with_backup(
+                        image=image,
+                        prompt_index=prompt_index,
+                        image_index=image_index,
+                        prompt=prompt,
+                        batch_root=batch_root,
+                        backup_batch_root=backup_batch_root,
+                    )
+                    elapsed = perf_counter() - request_start
+                    caption = build_gallery_caption(
+                        model_label=MODEL_LABELS.get(task["model_id"], task["model_id"]),
+                        prompt=prompt,
+                        seed=image_seed,
+                        elapsed_seconds=elapsed,
+                        aspect_ratio=task["aspect_ratio"],
+                        resolution=task["resolution"],
+                        grounding_summary=grounding_summary,
+                    )
+                    reference_summary = f"参考图：{describe_batch_task_references(task)}"
+                    gallery_items.append(
+                        (
+                            str(primary_path),
+                            f"第 {prompt_index} 行 / 图 {image_index}\n{caption}\n{reference_summary}",
+                        )
+                    )
+                    saved_primary_paths.append(primary_path)
+                    saved_backup_paths.append(backup_path)
+                    prompt_success_count += 1
+                    rows[row_position][4] = f"{prompt_success_count}/{per_prompt_count}"
+                except Exception as exc:
+                    last_error = map_error_message(exc)
+                    rows[row_position][5] = last_error
+                    break
+
+            if prompt_success_count == per_prompt_count:
+                rows[row_position][1] = "成功"
+            elif prompt_success_count > 0:
+                rows[row_position][1] = "部分成功"
+            elif cancelled and not last_error:
+                rows[row_position][1] = "已取消"
             else:
-                tools, actual_image_search_enabled = None, False
-                grounding_notes = []
-            actual_google_search_enabled = bool(tools)
-            grounding_summary = summarize_grounding_mode(
-                actual_google_search_enabled, actual_image_search_enabled
-            )
-            effective_prompt = build_effective_prompt(
-                prompt=prompt,
-                needs_ratio_postprocess=needs_ratio_postprocess,
-                aspect_ratio=task["aspect_ratio"],
-            )
-        except Exception as exc:
-            last_error = str(exc) if isinstance(exc, ValueError) else map_error_message(exc)
-            rows[row_position][1] = "失败"
-            rows[row_position][5] = last_error
+                rows[row_position][1] = "失败"
+
+            note_parts = []
+            if cancelled and prompt_success_count < per_prompt_count:
+                note_parts.append(f"已取消：剩余 {per_prompt_count - prompt_success_count} 张未生成")
+            if task["prompt_source"] != "用户输入":
+                note_parts.append("Prompt 使用默认图生图提示")
+            note_parts.extend(row_notes)
+            if grounding_notes:
+                note_parts.extend(grounding_notes)
+            if note_parts and not rows[row_position][5]:
+                rows[row_position][5] = "；".join(note_parts)
+            elif last_error and (grounding_notes or row_notes):
+                rows[row_position][5] = f"{last_error}；" + "；".join([*row_notes, *grounding_notes])
+
+            prompt_history_update = gr.update()
+            if prompt_success_count > 0:
+                prompt_history = add_prompt_history_entry(
+                    str(task["prompt"]),
+                    {
+                        "model_id": task["model_id"],
+                        "aspect_ratio": task["aspect_ratio"],
+                        "resolution": task["resolution"],
+                        "image_count": prompt_success_count,
+                        "keep_seed": bool(task["keep_seed"]),
+                        "seed": base_seed,
+                        "enable_google_search": actual_google_search_enabled,
+                        "enable_image_search": actual_image_search_enabled,
+                    },
+                )
+                prompt_history_update = gr.update(
+                    choices=build_prompt_history_choices(prompt_history),
+                    value=None,
+                )
+
             yield (
                 gr.update(value=gallery_items),
                 clone_batch_rows(rows),
                 gr.update(value=[str(path) for path in saved_primary_paths], visible=bool(saved_primary_paths)),
                 gr.update(value=None, visible=False),
-                f"第 {prompt_index} 行任务准备失败，已继续处理后续任务。",
+                f"已处理 {task_order}/{len(tasks)} 行任务。",
                 folder_markdown,
-                gr.update(),
-            )
-            continue
-
-        for image_index in range(1, per_prompt_count + 1):
-            global_image_index += 1
-            image_seed = base_seed + image_index - 1
-            progress(
-                global_image_index / max(1, total_requested),
-                desc=f"批量生图：第 {task_order}/{len(tasks)} 行，图片 {image_index}/{per_prompt_count}",
-            )
-            request_start = perf_counter()
-            try:
-                if protocol == API_PROTOCOL_OPENAI_IMAGES:
-                    image, size_mismatch_note = generate_openai_image(
-                        api_key=api_key,
-                        proxy_url=proxy_url,
-                        api_base_url=api_base_url,
-                        model_id=task["model_id"],
-                        prompt=effective_prompt,
-                        reference_paths=task["reference_paths"],
-                        resolution=task["resolution"],
-                        api_aspect_ratio=api_aspect_ratio,
-                        quality=task["quality"],
-                    )
-                    if size_mismatch_note and size_mismatch_note not in row_notes:
-                        row_notes.append(size_mismatch_note)
-                elif protocol == API_PROTOCOL_KIE:
-                    image, kie_note = generate_kie_image(
-                        api_key=api_key,
-                        proxy_url=proxy_url,
-                        api_base_url=api_base_url,
-                        model_id=task["model_id"],
-                        prompt=effective_prompt,
-                        reference_paths=task["reference_paths"],
-                        resolution=task["resolution"],
-                        api_aspect_ratio=api_aspect_ratio,
-                    )
-                    if kie_note and kie_note not in row_notes:
-                        row_notes.append(kie_note)
-                elif protocol == API_PROTOCOL_OPENAI_CHAT:
-                    image = generate_openai_chat_image(
-                        api_key=api_key,
-                        proxy_url=proxy_url,
-                        api_base_url=api_base_url,
-                        model_id=task["model_id"],
-                        prompt=effective_prompt,
-                        reference_paths=task["reference_paths"],
-                    )
-                else:
-                    config_kwargs: dict[str, Any] = {
-                        "response_modalities": ["Image"],
-                        "seed": image_seed,
-                        "candidate_count": 1,
-                        "http_options": make_request_http_options(api_base_url),
-                    }
-                    if tools:
-                        config_kwargs["tools"] = tools
-                    if api_aspect_ratio:
-                        config_kwargs["image_config"] = types.ImageConfig(
-                            aspect_ratio=api_aspect_ratio,
-                            image_size=api_image_size,
-                        )
-                    else:
-                        config_kwargs["image_config"] = types.ImageConfig(image_size=api_image_size)
-
-                    if client is None:
-                        raise RuntimeError("Gemini 客户端未初始化。")
-                    response = client.models.generate_content(
-                        model=task["model_id"],
-                        contents=types.Content(
-                            role="user",
-                            parts=[types.Part.from_text(text=effective_prompt), *reference_parts],
-                        ),
-                        config=types.GenerateContentConfig(**config_kwargs),
-                    )
-                    image = extract_first_image(response)
-                image = postprocess_image(
-                    image=image,
-                    requested_aspect_ratio=task["aspect_ratio"],
-                    requested_resolution=task["resolution"],
-                    needs_ratio_postprocess=needs_ratio_postprocess,
-                    needs_resize_postprocess=needs_resize_postprocess,
-                )
-                primary_path, backup_path = save_batch_image_with_backup(
-                    image=image,
-                    prompt_index=prompt_index,
-                    image_index=image_index,
-                    prompt=prompt,
-                    batch_root=batch_root,
-                    backup_batch_root=backup_batch_root,
-                )
-                elapsed = perf_counter() - request_start
-                caption = build_gallery_caption(
-                    model_label=MODEL_LABELS.get(task["model_id"], task["model_id"]),
-                    prompt=prompt,
-                    seed=image_seed,
-                    elapsed_seconds=elapsed,
-                    aspect_ratio=task["aspect_ratio"],
-                    resolution=task["resolution"],
-                    grounding_summary=grounding_summary,
-                )
-                reference_summary = (
-                    f"参考图：{len(task['reference_paths'])} 张"
-                    if task["reference_paths"]
-                    else "参考图：无（文生图）"
-                )
-                gallery_items.append(
-                    (
-                        str(primary_path),
-                        f"第 {prompt_index} 行 / 图 {image_index}\n{caption}\n{reference_summary}",
-                    )
-                )
-                saved_primary_paths.append(primary_path)
-                saved_backup_paths.append(backup_path)
-                prompt_success_count += 1
-                rows[row_position][4] = f"{prompt_success_count}/{per_prompt_count}"
-            except Exception as exc:
-                last_error = map_error_message(exc)
-                rows[row_position][5] = last_error
-                break
-
-        if prompt_success_count == per_prompt_count:
-            rows[row_position][1] = "成功"
-        elif prompt_success_count > 0:
-            rows[row_position][1] = "部分成功"
-        else:
-            rows[row_position][1] = "失败"
-
-        note_parts = []
-        if task["prompt_source"] != "用户输入":
-            note_parts.append("Prompt 使用默认图生图提示")
-        note_parts.extend(row_notes)
-        if grounding_notes:
-            note_parts.extend(grounding_notes)
-        if note_parts and not rows[row_position][5]:
-            rows[row_position][5] = "；".join(note_parts)
-        elif last_error and (grounding_notes or row_notes):
-            rows[row_position][5] = f"{last_error}；" + "；".join([*row_notes, *grounding_notes])
-
-        prompt_history_update = gr.update()
-        if prompt_success_count > 0:
-            prompt_history = add_prompt_history_entry(
-                str(task["prompt"]),
-                {
-                    "model_id": task["model_id"],
-                    "aspect_ratio": task["aspect_ratio"],
-                    "resolution": task["resolution"],
-                    "image_count": prompt_success_count,
-                    "keep_seed": bool(task["keep_seed"]),
-                    "seed": base_seed,
-                    "enable_google_search": actual_google_search_enabled,
-                    "enable_image_search": actual_image_search_enabled,
-                },
-            )
-            prompt_history_update = gr.update(
-                choices=build_prompt_history_choices(prompt_history),
-                value=None,
+                prompt_history_update,
             )
 
-        yield (
-            gr.update(value=gallery_items),
-            clone_batch_rows(rows),
-            gr.update(value=[str(path) for path in saved_primary_paths], visible=bool(saved_primary_paths)),
-            gr.update(value=None, visible=False),
-            f"已处理 {task_order}/{len(tasks)} 行任务。",
-            folder_markdown,
-            prompt_history_update,
+    finally:
+        # 正常跑完、点了取消、或页面被关掉（Gradio 关闭生成器）都会走到这里，保证记录落盘。
+        unregister_batch_run(session_key, cancel_event)
+        mark_unfinished_batch_rows(rows, "已取消" if cancel_event.is_set() else "未完成")
+        manifest = build_batch_manifest(
+            batch_name=final_batch_name,
+            tasks=tasks,
+            rows=rows,
+            image_paths=saved_primary_paths,
+            backup_paths=saved_backup_paths,
+            zip_path=None,
+            backup_zip_path=None,
         )
+        write_json_file(batch_root / "batch_manifest.json", manifest)
+        write_json_file(backup_batch_root / "batch_manifest.json", manifest)
 
     total_elapsed = perf_counter() - batch_start
-    manifest = build_batch_manifest(
-        batch_name=final_batch_name,
-        tasks=tasks,
-        rows=rows,
-        image_paths=saved_primary_paths,
-        backup_paths=saved_backup_paths,
-        zip_path=None,
-        backup_zip_path=None,
-    )
-    write_json_file(batch_root / "batch_manifest.json", manifest)
-    write_json_file(backup_batch_root / "batch_manifest.json", manifest)
 
     success_prompts = sum(1 for row in rows if row[1] == "成功")
     partial_prompts = sum(1 for row in rows if row[1] == "部分成功")
     failed_prompts = sum(1 for row in rows if row[1] == "失败")
-    final_status = (
-        f"批量完成：任务成功 **{success_prompts}** 行，部分成功 **{partial_prompts}** 行，"
-        f"失败 **{failed_prompts}** 行；共生成 **{len(saved_primary_paths)}/{total_requested}** 张图，"
-        f"耗时 **{total_elapsed:.1f} 秒**。\n\n"
-        "每行使用自己的参考图、Prompt 和参数，详细记录已写入本批次目录的 `batch_manifest.json`。"
-    )
+    cancelled_prompts = sum(1 for row in rows if row[1] == "已取消")
+    if cancelled:
+        final_status = (
+            f"批量已取消：任务成功 **{success_prompts}** 行，部分成功 **{partial_prompts}** 行，"
+            f"失败 **{failed_prompts}** 行，取消 **{cancelled_prompts}** 行；"
+            f"共生成 **{len(saved_primary_paths)}/{total_requested}** 张图，耗时 **{total_elapsed:.1f} 秒**。\n\n"
+            "已生成的图片都已保存，记录已写入本批次目录的 `batch_manifest.json`。"
+        )
+    else:
+        final_status = (
+            f"批量完成：任务成功 **{success_prompts}** 行，部分成功 **{partial_prompts}** 行，"
+            f"失败 **{failed_prompts}** 行；共生成 **{len(saved_primary_paths)}/{total_requested}** 张图，"
+            f"耗时 **{total_elapsed:.1f} 秒**。\n\n"
+            "每行使用自己的参考图、Prompt 和参数，详细记录已写入本批次目录的 `batch_manifest.json`。"
+        )
 
     yield (
         gr.update(value=gallery_items),
@@ -6423,16 +6599,57 @@ def build_demo() -> gr.Blocks:
                         elem_classes=["generate-button"],
                         scale=2,
                     )
+                    batch_cancel_button = gr.Button(
+                        "取消生成",
+                        variant="secondary",
+                        elem_classes=["cancel-button"],
+                        scale=1,
+                    )
                 batch_row_count_markdown = gr.Markdown(
                     build_batch_visible_rows_text(INITIAL_BATCH_ROWS),
                     elem_classes=["muted-note"],
                 )
                 gr.Markdown(
-                    f"默认显示 {INITIAL_BATCH_ROWS} 个批次，可手动添加至 {MAX_BATCH_ROWS} 个；每个批次最多 {MAX_REFERENCE_IMAGES} 张参考图、最多 {MAX_GENERATE_IMAGES} 张输出。只填 Prompt 就是文生图，只上传参考图也会使用默认图生图提示。",
+                    f"默认显示 {INITIAL_BATCH_ROWS} 个批次，可手动添加至 {MAX_BATCH_ROWS} 个；每个批次最多 {MAX_REFERENCE_IMAGES} 张参考图（含统一参考图）、最多 {MAX_GENERATE_IMAGES} 张输出。只填 Prompt 就是文生图，只上传参考图也会使用默认图生图提示。",
                     elem_classes=["muted-note"],
                 )
 
                 with gr.Row(elem_classes=["batch-toolbar"]):
+                    with gr.Column(scale=3, min_width=420, elem_classes=["surface-card", "batch-default-card"]):
+                        with gr.Accordion("统一参考图（可选，所有批次共用）", open=False, elem_classes=["sub-accordion"]):
+                            batch_shared_reference_paths_state = gr.State([])
+                            batch_shared_reference_files = gr.File(
+                                label="上传统一参考图",
+                                file_count="multiple",
+                                file_types=["image"],
+                                type="filepath",
+                                height=112,
+                            )
+                            batch_shared_reference_gallery = gr.Gallery(
+                                label="已添加统一参考图",
+                                value=[],
+                                visible=False,
+                                columns=5,
+                                preview=True,
+                                object_fit="cover",
+                                height=96,
+                                buttons=["fullscreen"],
+                            )
+                            batch_shared_reference_hint = gr.Markdown(
+                                build_batch_shared_reference_hint([]),
+                                elem_classes=["muted-note"],
+                            )
+                            batch_shared_reference_position_radio = gr.Radio(
+                                label="与每行参考图的顺序",
+                                choices=SHARED_REFERENCE_POSITION_CHOICES,
+                                value=SHARED_REFERENCE_POSITION_FIRST,
+                                info="Prompt 里用「第 1 张图」这类说法时，顺序会影响模型理解。",
+                            )
+                            batch_shared_reference_clear_button = gr.Button(
+                                "清空统一参考图",
+                                variant="secondary",
+                                size="sm",
+                            )
                     with gr.Column(scale=3, min_width=420, elem_classes=["surface-card", "batch-default-card"]):
                         with gr.Accordion("统一 Prompt 补充（可选）", open=False, elem_classes=["sub-accordion"]):
                             batch_prompt_suffix_box = gr.Textbox(
@@ -6855,9 +7072,30 @@ def build_demo() -> gr.Blocks:
             fn=preview_batch_tasks_handler,
             inputs=[
                 batch_prompt_suffix_box,
+                batch_shared_reference_paths_state,
+                batch_shared_reference_position_radio,
                 *batch_row_inputs,
             ],
             outputs=[batch_status_table, batch_status_markdown],
+        )
+        batch_shared_reference_files.change(
+            fn=append_batch_shared_reference_images_handler,
+            inputs=[batch_shared_reference_files, batch_shared_reference_paths_state],
+            outputs=[
+                batch_shared_reference_files,
+                batch_shared_reference_gallery,
+                batch_shared_reference_paths_state,
+                batch_shared_reference_hint,
+            ],
+        )
+        batch_shared_reference_clear_button.click(
+            fn=clear_batch_shared_reference_images_handler,
+            outputs=[
+                batch_shared_reference_files,
+                batch_shared_reference_gallery,
+                batch_shared_reference_paths_state,
+                batch_shared_reference_hint,
+            ],
         )
         add_batch_row_button.click(
             fn=add_batch_row_handler,
@@ -6873,6 +7111,11 @@ def build_demo() -> gr.Blocks:
             inputs=api_protocol_dropdown,
             outputs=[
                 batch_prompt_suffix_box,
+                batch_shared_reference_files,
+                batch_shared_reference_gallery,
+                batch_shared_reference_paths_state,
+                batch_shared_reference_hint,
+                batch_shared_reference_position_radio,
                 *batch_row_clear_outputs,
                 batch_visible_rows_state,
                 *batch_row_containers,
@@ -7064,6 +7307,8 @@ def build_demo() -> gr.Blocks:
                 output_root_box,
                 backup_root_box,
                 batch_prompt_suffix_box,
+                batch_shared_reference_paths_state,
+                batch_shared_reference_position_radio,
                 *batch_row_inputs,
             ],
             outputs=[
@@ -7075,6 +7320,11 @@ def build_demo() -> gr.Blocks:
                 batch_folder_markdown,
                 prompt_history_dropdown,
             ],
+        )
+        # 不挂 cancels：由生成循环在下一张图前自己停下，最后仍会输出完整的结果和状态。
+        batch_cancel_button.click(
+            fn=cancel_batch_generate_handler,
+            outputs=batch_status_markdown,
         )
 
         # —— 图片编辑：四个标签页的按钮事件 ——
