@@ -4856,11 +4856,20 @@ def build_batch_shared_reference_hint(file_paths: list[str] | None = None) -> st
     """批量页统一参考图提示。"""
     paths = file_paths or []
     if not paths:
-        return "未添加统一参考图。这里的图会附加到每一个有内容的批次，适合放所有图都要参考的产品、人物或风格图。"
+        return "未添加统一参考图。这里的图会附加到下方选定的前几个批次，适合放这些图都要参考的产品、人物或风格图。"
     return (
-        f"已添加 {len(paths)} 张统一参考图，会附加到每一个有内容的批次；"
+        f"已添加 {len(paths)} 张统一参考图，会附加到下方选定的前几个批次（空批次照样跳过）；"
         f"与本行参考图合计最多 {MAX_REFERENCE_IMAGES} 张。"
     )
+
+
+def normalize_shared_reference_row_limit(value: Any) -> int:
+    """统一参考图应用到前几个批次；空值或异常值视为全部。"""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return MAX_BATCH_ROWS
+    return max(1, min(limit, MAX_BATCH_ROWS))
 
 
 def append_batch_shared_reference_images_handler(
@@ -4923,10 +4932,12 @@ def collect_batch_tasks(
     global_prompt_suffix: str | None = None,
     shared_reference_paths: Any = None,
     shared_reference_position: str | None = SHARED_REFERENCE_POSITION_FIRST,
+    shared_reference_row_limit: Any = None,
 ) -> list[dict[str, Any]]:
     """从固定任务表里收集有效行；空行自动跳过。
 
-    统一参考图会附加到每一个有内容的行，但它本身不会让空行变成任务。
+    统一参考图只附加到第 1～shared_reference_row_limit 个批次里有内容的行，
+    它本身不会让空行变成任务。
     """
     if len(row_values) % MAX_BATCH_ROW_INPUT_SIZE != 0:
         raise ValueError("批量任务表参数数量异常，请刷新页面后再试。")
@@ -4934,6 +4945,7 @@ def collect_batch_tasks(
     shared_paths = normalize_uploaded_reference_paths(shared_reference_paths)
     if len(shared_paths) > MAX_REFERENCE_IMAGES:
         raise ValueError(f"统一参考图最多 {MAX_REFERENCE_IMAGES} 张，请删减后再生成。")
+    shared_row_limit = normalize_shared_reference_row_limit(shared_reference_row_limit)
 
     tasks: list[dict[str, Any]] = []
     clean_global_suffix = (global_prompt_suffix or "").strip()
@@ -4957,13 +4969,14 @@ def collect_batch_tasks(
         clean_prompt = (prompt_value or "").strip()
         if not clean_prompt and not row_reference_paths:
             continue
+        row_shared_paths = shared_paths if row_index <= shared_row_limit else []
         reference_paths = combine_batch_reference_paths(
-            shared_paths, row_reference_paths, shared_reference_position
+            row_shared_paths, row_reference_paths, shared_reference_position
         )
         if len(reference_paths) > MAX_REFERENCE_IMAGES:
-            if shared_paths:
+            if row_shared_paths:
                 raise ValueError(
-                    f"第 {row_index} 行：统一参考图 {len(shared_paths)} 张 + 本行 {len(row_reference_paths)} 张，"
+                    f"第 {row_index} 行：统一参考图 {len(row_shared_paths)} 张 + 本行 {len(row_reference_paths)} 张，"
                     f"超过 {MAX_REFERENCE_IMAGES} 张上限，请删减后再生成。"
                 )
             raise ValueError(f"第 {row_index} 行最多上传 {MAX_REFERENCE_IMAGES} 张参考图，请删减后再生成。")
@@ -4979,7 +4992,7 @@ def collect_batch_tasks(
         task = {
             "row_index": row_index,
             "reference_paths": reference_paths,
-            "shared_reference_count": len(shared_paths),
+            "shared_reference_count": len(row_shared_paths),
             "prompt": final_prompt,
             "row_prompt": clean_prompt,
             "global_prompt_suffix": clean_global_suffix,
@@ -5047,12 +5060,17 @@ def preview_batch_tasks_handler(
     global_prompt_suffix: str,
     shared_reference_paths: list[str] | None,
     shared_reference_position: str,
+    shared_reference_row_limit: int,
     *row_values: Any,
 ) -> tuple[list[list[Any]], str]:
     """生成前预览有效任务，降低误跑大批次的风险。"""
     try:
         tasks = collect_batch_tasks(
-            row_values, global_prompt_suffix, shared_reference_paths, shared_reference_position
+            row_values,
+            global_prompt_suffix,
+            shared_reference_paths,
+            shared_reference_position,
+            shared_reference_row_limit,
         )
     except ValueError as exc:
         return [], f"预览未通过：{exc}"
@@ -5065,9 +5083,18 @@ def preview_batch_tasks_handler(
         f"其中图生图 **{image_to_image_count}** 行、文生图 **{text_to_image_count}** 行，"
         f"预计生成 **{total_images}** 张图。确认无误后点击“开始批量生成”。"
     )
-    shared_count = int(tasks[0].get("shared_reference_count") or 0)
-    if shared_count:
-        status = f"{status}\n\n每行都会附带 **{shared_count}** 张统一参考图（{shared_reference_position}）。"
+    shared_rows = [task for task in tasks if task.get("shared_reference_count")]
+    row_limit = normalize_shared_reference_row_limit(shared_reference_row_limit)
+    if shared_rows:
+        status = (
+            f"{status}\n\n其中 **{len(shared_rows)}** 行附带 **{shared_rows[0]['shared_reference_count']}** 张统一参考图"
+            f"（应用到前 {row_limit} 个批次，{shared_reference_position}）。"
+        )
+    elif normalize_uploaded_reference_paths(shared_reference_paths):
+        status = (
+            f"{status}\n\n注意：统一参考图只应用到前 {row_limit} 个批次，但这些批次都是空的，"
+            "本次不会用到统一参考图。"
+        )
     return build_batch_task_rows(tasks, "已识别"), status
 
 
@@ -5130,6 +5157,7 @@ def clear_batch_table_handler(api_protocol: str) -> tuple[Any, ...]:
         gr.update(value=""),
         *clear_batch_shared_reference_images_handler(),
         gr.update(value=SHARED_REFERENCE_POSITION_FIRST),
+        gr.update(maximum=INITIAL_BATCH_ROWS, value=INITIAL_BATCH_ROWS),
         *row_updates,
         INITIAL_BATCH_ROWS,
         *build_batch_row_visibility_updates(INITIAL_BATCH_ROWS),
@@ -5164,16 +5192,20 @@ def build_batch_row_visibility_updates(visible_count: int) -> list[Any]:
     return [gr.update(visible=index <= count) for index in range(1, MAX_BATCH_ROWS + 1)]
 
 
-def add_batch_row_handler(visible_count: Any) -> tuple[Any, ...]:
-    """手动展开一个新的批次行。"""
+def add_batch_row_handler(visible_count: Any, shared_reference_row_limit: Any = None) -> tuple[Any, ...]:
+    """手动展开一个新的批次行，统一参考图滑块的上限跟着变。"""
     current_count = normalize_batch_visible_count(visible_count)
     next_count = min(current_count + 1, MAX_BATCH_ROWS)
     if current_count >= MAX_BATCH_ROWS:
         gr.Warning(f"当前最多支持 {MAX_BATCH_ROWS} 个批次。")
+    row_limit = normalize_shared_reference_row_limit(shared_reference_row_limit)
+    # 滑块原本拉满（= 应用到全部批次）时跟着新批次一起加；否则保持用户选的数。
+    next_row_limit = next_count if row_limit >= current_count else row_limit
     return (
         next_count,
         *build_batch_row_visibility_updates(next_count),
         build_batch_visible_rows_text(next_count),
+        gr.update(maximum=next_count, value=next_row_limit),
     )
 
 
@@ -5287,6 +5319,7 @@ def batch_generate_handler(
     global_prompt_suffix: str,
     shared_reference_paths: list[str] | None,
     shared_reference_position: str,
+    shared_reference_row_limit: int,
     # gr.Request 只有写在 *row_values 之前才会被 Gradio 注入。
     request: gr.Request,
     *row_values: Any,
@@ -5299,7 +5332,11 @@ def batch_generate_handler(
     try:
         protocol = normalize_api_protocol(api_protocol)
         tasks = collect_batch_tasks(
-            row_values, global_prompt_suffix, shared_reference_paths, shared_reference_position
+            row_values,
+            global_prompt_suffix,
+            shared_reference_paths,
+            shared_reference_position,
+            shared_reference_row_limit,
         )
         total_requested = sum(int(task["images_per_prompt"]) for task in tasks)
         output_root_path, backup_root_path = ensure_storage_roots(output_root, backup_root)
@@ -6616,7 +6653,7 @@ def build_demo() -> gr.Blocks:
 
                 with gr.Row(elem_classes=["batch-toolbar"]):
                     with gr.Column(scale=3, min_width=420, elem_classes=["surface-card", "batch-default-card"]):
-                        with gr.Accordion("统一参考图（可选，所有批次共用）", open=False, elem_classes=["sub-accordion"]):
+                        with gr.Accordion("统一参考图（可选，多个批次共用）", open=False, elem_classes=["sub-accordion"]):
                             batch_shared_reference_paths_state = gr.State([])
                             batch_shared_reference_files = gr.File(
                                 label="上传统一参考图",
@@ -6638,6 +6675,14 @@ def build_demo() -> gr.Blocks:
                             batch_shared_reference_hint = gr.Markdown(
                                 build_batch_shared_reference_hint([]),
                                 elem_classes=["muted-note"],
+                            )
+                            batch_shared_reference_row_limit_slider = gr.Slider(
+                                label="应用到前几个批次",
+                                minimum=1,
+                                maximum=INITIAL_BATCH_ROWS,
+                                step=1,
+                                value=INITIAL_BATCH_ROWS,
+                                info="例如设为 5：只有第 1～5 个批次附带统一参考图，后面的批次不带。拉满 = 全部批次。",
                             )
                             batch_shared_reference_position_radio = gr.Radio(
                                 label="与每行参考图的顺序",
@@ -7074,6 +7119,7 @@ def build_demo() -> gr.Blocks:
                 batch_prompt_suffix_box,
                 batch_shared_reference_paths_state,
                 batch_shared_reference_position_radio,
+                batch_shared_reference_row_limit_slider,
                 *batch_row_inputs,
             ],
             outputs=[batch_status_table, batch_status_markdown],
@@ -7099,11 +7145,12 @@ def build_demo() -> gr.Blocks:
         )
         add_batch_row_button.click(
             fn=add_batch_row_handler,
-            inputs=batch_visible_rows_state,
+            inputs=[batch_visible_rows_state, batch_shared_reference_row_limit_slider],
             outputs=[
                 batch_visible_rows_state,
                 *batch_row_containers,
                 batch_row_count_markdown,
+                batch_shared_reference_row_limit_slider,
             ],
         )
         clear_batch_button.click(
@@ -7116,6 +7163,7 @@ def build_demo() -> gr.Blocks:
                 batch_shared_reference_paths_state,
                 batch_shared_reference_hint,
                 batch_shared_reference_position_radio,
+                batch_shared_reference_row_limit_slider,
                 *batch_row_clear_outputs,
                 batch_visible_rows_state,
                 *batch_row_containers,
@@ -7309,6 +7357,7 @@ def build_demo() -> gr.Blocks:
                 batch_prompt_suffix_box,
                 batch_shared_reference_paths_state,
                 batch_shared_reference_position_radio,
+                batch_shared_reference_row_limit_slider,
                 *batch_row_inputs,
             ],
             outputs=[
