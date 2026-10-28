@@ -9,8 +9,12 @@
 | Gemini 原生 | `models/{model}:generateContent` | Gemini / Nano Banana 官方或原生中转 | `candidates[].content.parts[].inlineData` |
 | OpenAI Images | `images/generations`、`images/edits` | GPT Image 及实现标准 Images API 的中转站 | `b64_json` 或 `url` |
 | OpenAI Chat 生图 | `chat/completions` | 通过 Chat 扩展返回图片的常见中转站 | data URL、Markdown 图片、`message.images` 等 |
+| KIE 异步任务 | `api/v1/jobs/createTask` + 轮询 `recordInfo` | [kie.ai](https://kie.ai)，参考图先上传换 URL | `resultUrls` |
+| Grsai 异步任务 | `v1/api/generate` + 轮询 `v1/api/result` | [grsai](https://grsai.com) 的 Nano Banana / GPT Image，参考图以 base64 内联 | `results[].url` |
 
-协议由用户显式选择，程序不会再根据模型名称猜协议。专有的提交任务 / 轮询结果异步协议差异较大，目前不冒充通用协议；后续可按服务商单独增加适配器。
+协议由用户显式选择，程序不会再根据模型名称猜协议。专有的提交任务 / 轮询结果异步协议差异较大，不冒充通用协议，而是按服务商单独适配（目前有 kie.ai 和 grsai）。
+
+使用 grsai 时：Base URL 留空即用全球节点 `https://grsaiapi.com`，国内直连可填 `https://grsai.dakka.com.cn`；“测试连接”显示积分余额，“检测可用模型”会标出 grsai 正在维护或已下架的模型。
 
 ## 功能概览
 

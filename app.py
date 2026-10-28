@@ -152,11 +152,13 @@ API_PROTOCOL_GEMINI = "gemini"
 API_PROTOCOL_OPENAI_IMAGES = "openai_images"
 API_PROTOCOL_OPENAI_CHAT = "openai_chat"
 API_PROTOCOL_KIE = "kie"
+API_PROTOCOL_GRSAI = "grsai"
 API_PROTOCOL_CHOICES = [
     ("Gemini 原生（generateContent）", API_PROTOCOL_GEMINI),
     ("OpenAI Images（/v1/images）", API_PROTOCOL_OPENAI_IMAGES),
     ("OpenAI Chat 生图（/v1/chat/completions）", API_PROTOCOL_OPENAI_CHAT),
     ("KIE 异步任务（kie.ai）", API_PROTOCOL_KIE),
+    ("Grsai 异步任务（grsai.com）", API_PROTOCOL_GRSAI),
 ]
 
 # ── kie.ai ────────────────────────────────────────────────────────────────
@@ -221,6 +223,101 @@ def _load_kie_model_specs() -> dict[str, dict[str, Any]]:
 
 
 KIE_MODEL_SPECS: dict[str, dict[str, Any]] = _load_kie_model_specs()
+
+# ── grsai ─────────────────────────────────────────────────────────────────
+# grsai 的原生接口也是异步任务：提交后只拿到 id，再轮询结果。和 kie.ai 不同，
+# 参考图可以直接以 base64 放进请求体，不用先上传。Nano Banana 与 GPT Image 两个
+# 系列共用同一个接口，但画幅、分辨率、质量的传法不一样，按模型登记在下表。
+# 文档：https://qmy27nhsd9.apifox.cn/452392911e0（另有国内节点 grsai.dakka.com.cn）。
+GRSAI_DEFAULT_BASE_URL = "https://grsaiapi.com"
+GRSAI_CN_BASE_URL = "https://grsai.dakka.com.cn"
+GRSAI_GENERATE_PATH = "/v1/api/generate"
+GRSAI_RESULT_PATH = "/v1/api/result"
+GRSAI_CREDITS_PATH = "/client/openapi/getAPIKeyCredits"
+GRSAI_MODEL_STATUS_PATH = "/client/common/getModelStatus"
+GRSAI_POLL_INTERVAL_SECONDS = 2.0
+GRSAI_POLL_TIMEOUT_SECONDS = 900
+# 刚提交的任务偶尔查不到结果，这段时间内的“结果不存在”按排队处理。
+GRSAI_RESULT_GRACE_SECONDS = 60
+# 任务已经提交（已计费），轮询时的网络抖动不应让整张图作废，连续失败这么多次才放弃。
+GRSAI_POLL_MAX_NETWORK_ERRORS = 5
+# 积分与人民币的换算（官网模型页：参考价 = 积分 / 20000）。
+GRSAI_CREDITS_PER_YUAN = 20_000
+GRSAI_BANANA_ASPECTS = {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "21:9"}
+# Nano Banana 2 系列额外支持的超宽 / 超高比例。
+GRSAI_BANANA_2_ASPECTS = GRSAI_BANANA_ASPECTS | {"1:4", "4:1", "1:8", "8:1"}
+GRSAI_GPT_RATIO_ASPECTS = GRSAI_BANANA_ASPECTS | {"9:21", "2:1", "1:2"}
+# gpt-image-2-vip / 2.5-flare / 2.5-sunburst 只认像素值、不认比例，按文档的 1K/2K/4K 对照表换算。
+GRSAI_GPT_PIXEL_SIZES = {
+    "1:1": ("1024x1024", "2048x2048", "2880x2880"),
+    "16:9": ("1280x720", "2048x1152", "3840x2160"),
+    "9:16": ("720x1280", "1152x2048", "2160x3840"),
+    "4:3": ("1152x864", "2304x1728", "3264x2448"),
+    "3:4": ("864x1152", "1728x2304", "2448x3264"),
+    "3:2": ("1536x1024", "2048x1360", "3504x2336"),
+    "2:3": ("1024x1536", "1360x2048", "2336x3504"),
+    "5:4": ("1120x896", "2240x1792", "3200x2560"),
+    "4:5": ("896x1120", "1792x2240", "2560x3200"),
+    "21:9": ("1456x624", "2912x1248", "3840x1648"),
+    "9:21": ("624x1456", "1248x2912", "1648x3840"),
+    "2:1": ("1536x768", "3072x1536", "3840x1920"),
+    "1:2": ("768x1536", "1536x3072", "1920x3840"),
+}
+GRSAI_PIXEL_SIZE_INDEX = {"512": 0, "1K": 0, "2K": 1, "4K": 2}
+
+
+def _grsai_banana(label: str, resolutions: set[str], aspects: set[str]) -> dict[str, Any]:
+    return {"label": label, "family": "banana", "resolutions": resolutions, "aspects": aspects}
+
+
+def _grsai_gpt(label: str, pixel_sizes: bool, qualities: set[str]) -> dict[str, Any]:
+    return {
+        "label": label,
+        "family": "gpt",
+        # 只认比例的模型固定 1K；认像素值的模型可到 4K，并支持透明背景。
+        "resolutions": {"1K", "2K", "4K"} if pixel_sizes else {"1K"},
+        "aspects": set(GRSAI_GPT_PIXEL_SIZES) if pixel_sizes else set(GRSAI_GPT_RATIO_ASPECTS),
+        "pixel_sizes": pixel_sizes,
+        "qualities": qualities,
+        "background": pixel_sizes,
+    }
+
+
+# 按 grsai 模型页（https://grsai.com/dashboard/models）登记；便宜常用的排前面。
+# 下拉框仍可直接输入表里没有的模型 ID，按名字推断参数。
+GRSAI_MODEL_SPECS: dict[str, dict[str, Any]] = {
+    "nano-banana-2": _grsai_banana(
+        "Nano Banana 2（grsai）— 1K/2K/4K", {"1K", "2K", "4K"}, GRSAI_BANANA_2_ASPECTS),
+    "nano-banana-pro": _grsai_banana(
+        "Nano Banana Pro（grsai）— 1K/2K/4K", {"1K", "2K", "4K"}, GRSAI_BANANA_ASPECTS),
+    "nano-banana-2.1": _grsai_banana(
+        "Nano Banana 2.1（grsai）— 1K/2K/4K", {"1K", "2K", "4K"}, GRSAI_BANANA_2_ASPECTS),
+    "nano-banana-fast": _grsai_banana(
+        "Nano Banana Fast（2.5 Flash，grsai）— 只有 1K", {"1K"}, GRSAI_BANANA_ASPECTS),
+    "nano-banana-2-lite": _grsai_banana(
+        "Nano Banana 2 Lite（grsai）— 只有 1K", {"1K"}, GRSAI_BANANA_2_ASPECTS),
+    "gpt-image-2": _grsai_gpt("GPT Image 2（grsai）— 只有 1K", False, set()),
+    "gpt-image-2.5": _grsai_gpt("GPT Image 2.5（grsai）— 只有 1K", False, set()),
+    "gpt-image-2-vip": _grsai_gpt("GPT Image 2 VIP（grsai）— 1K/2K/4K", True, {"medium"}),
+    "gpt-image-2.5-flare": _grsai_gpt(
+        "GPT Image 2.5 Flare（grsai）— 1K/2K/4K", True, {"low", "medium", "high"}),
+    "gpt-image-2.5-sunburst": _grsai_gpt(
+        "GPT Image 2.5 Sunburst（grsai）— 1K/2K/4K", True,
+        {"low", "medium", "high", "xhigh", "max"}),
+    # 以下为单价更高的线路，分辨率固定或受限。
+    "nano-banana-2-cl": _grsai_banana(
+        "nano-banana-2-cl（grsai）— 只有 1K", {"1K"}, GRSAI_BANANA_2_ASPECTS),
+    "nano-banana-2-2k-cl": _grsai_banana(
+        "nano-banana-2-2k-cl（grsai）— 只有 2K", {"2K"}, GRSAI_BANANA_2_ASPECTS),
+    "nano-banana-2-4k-cl": _grsai_banana(
+        "nano-banana-2-4k-cl（grsai）— 只有 4K", {"4K"}, GRSAI_BANANA_2_ASPECTS),
+    "nano-banana-pro-cl": _grsai_banana(
+        "nano-banana-pro-cl（grsai）— 只有 1K", {"1K"}, GRSAI_BANANA_ASPECTS),
+    "nano-banana-pro-vip": _grsai_banana(
+        "nano-banana-pro-vip（grsai）— 1K/2K", {"1K", "2K"}, GRSAI_BANANA_ASPECTS),
+    "nano-banana-pro-4k-vip": _grsai_banana(
+        "nano-banana-pro-4k-vip（grsai）— 只有 4K", {"4K"}, GRSAI_BANANA_ASPECTS),
+}
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 LEGACY_APIYI_BASE_URL = "https://api.apiyi.com"
 GPT_IMAGE_2_VIP_MODEL_ID = "gpt-image-2-vip"
@@ -424,6 +521,13 @@ def get_model_meta(model_id: str) -> dict[str, Any]:
         "supports_quality": True,
         "api_kind": "auto",
     }
+
+
+def model_display_label(api_protocol: str, model_id: str) -> str:
+    """结果说明里的模型名；grsai 和其它渠道有同名模型，按协议取名称。"""
+    if normalize_api_protocol(api_protocol) == API_PROTOCOL_GRSAI and model_id in GRSAI_MODEL_SPECS:
+        return GRSAI_MODEL_SPECS[model_id]["label"]
+    return MODEL_LABELS.get(model_id, model_id)
 
 
 MODEL_FALLBACK_ASPECTS = {
@@ -830,10 +934,12 @@ def normalize_api_protocol(api_protocol: str | None) -> str:
         "openai-chat": API_PROTOCOL_OPENAI_CHAT,
         "kie.ai": API_PROTOCOL_KIE,
         "kieai": API_PROTOCOL_KIE,
+        "grsai.com": API_PROTOCOL_GRSAI,
+        "grsai.ai": API_PROTOCOL_GRSAI,
     }
     value = aliases.get(value, value)
     if value in {API_PROTOCOL_GEMINI, API_PROTOCOL_OPENAI_IMAGES, API_PROTOCOL_OPENAI_CHAT,
-                 API_PROTOCOL_KIE}:
+                 API_PROTOCOL_KIE, API_PROTOCOL_GRSAI}:
         return value
     return API_PROTOCOL_GEMINI
 
@@ -846,6 +952,7 @@ def protocol_display_name(api_protocol: str) -> str:
         API_PROTOCOL_OPENAI_IMAGES: "OpenAI Images",
         API_PROTOCOL_OPENAI_CHAT: "OpenAI Chat 生图",
         API_PROTOCOL_KIE: "KIE 异步任务",
+        API_PROTOCOL_GRSAI: "Grsai 异步任务",
     }[protocol]
 
 
@@ -2393,6 +2500,332 @@ def generate_kie_image(
     return image, ("\n\n".join(notes) or None)
 
 
+def grsai_model_spec(model_id: str) -> dict[str, Any]:
+    """取 grsai 模型的参数差异；未登记的模型（grsai 以后上新的）按名字推断。"""
+    clean = (model_id or "").strip()
+    spec = GRSAI_MODEL_SPECS.get(clean)
+    if spec:
+        return spec
+    lower = clean.lower()
+    if lower.startswith("gpt-image"):
+        # 带 vip / flare / sunburst 的高阶模型只认像素值；质量档位未知，用户选什么就发什么。
+        pixel_sizes = any(word in lower for word in ("vip", "flare", "sunburst"))
+        inferred = _grsai_gpt(clean, pixel_sizes, set(QUALITY_CHOICES[1:]) if pixel_sizes else set())
+    else:
+        aspects = GRSAI_BANANA_2_ASPECTS if "banana-2" in lower else GRSAI_BANANA_ASPECTS
+        inferred = _grsai_banana(clean, {"1K", "2K", "4K"}, aspects)
+    return {**inferred, "inferred": True}
+
+
+def grsai_model_choices(statuses: dict[str, str] | None = None) -> list[tuple[str, str]]:
+    """grsai 的模型下拉选项；statuses 给出暂不可用模型的原因时附在名字后面。"""
+    choices: list[tuple[str, str]] = []
+    for model_id, spec in GRSAI_MODEL_SPECS.items():
+        reason = (statuses or {}).get(model_id)
+        label = f"{spec['label']}（暂不可用：{reason}）" if reason else spec["label"]
+        choices.append((label, model_id))
+    return choices
+
+
+def grsai_url(api_base_url: str, path: str) -> str:
+    """拼 grsai 接口地址。
+
+    Base URL 只有指向 grsai 时才采用：设置里的 Base URL 是各协议共用的，切到 grsai 时
+    很可能还留着别家中转站的地址，照用会把 grsai 的 Key 发给别人。
+    """
+    base = normalize_api_base_url(api_base_url)
+    if "grsai" not in base.lower():
+        base = GRSAI_DEFAULT_BASE_URL
+    # 照着文档把 /v1 甚至完整接口地址填进来的，统一还原成根域名。
+    base = re.sub(r"/v1(?:/api(?:/[a-z]+)?)?$", "", base.rstrip("/"), flags=re.I)
+    return f"{base.rstrip('/')}{path}"
+
+
+def grsai_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {normalize_api_key(api_key)}",
+        "Content-Type": "application/json",
+    }
+
+
+def grsai_payload(response: httpx.Response) -> dict[str, Any]:
+    """解析 grsai 的响应。
+
+    部分接口声明 UTF-8、实际返回 GBK 编码的中文，直接 .json() 会乱码；
+    失败时 HTTP 400 也带正常 JSON（status=failed + error），所以不按状态码抛错。
+    """
+    raw = response.content
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("gbk", errors="replace")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        snippet = text.strip()[:200] or "空响应"
+        raise RuntimeError(f"grsai 返回了无法识别的内容（HTTP {response.status_code}）：{snippet}")
+    return payload
+
+
+def grsai_failure_message(payload: dict[str, Any]) -> str:
+    """把 grsai 的失败响应转成说明。"""
+    status = str(payload.get("status") or "").strip().lower()
+    reason = str(payload.get("failure_reason") or "").strip().lower()
+    detail = str(payload.get("error") or payload.get("msg") or "").strip()
+    if status == "violation" or reason in {"input_moderation", "output_moderation"}:
+        where = {"input_moderation": "输入的 Prompt 或参考图", "output_moderation": "生成结果"}.get(
+            reason, "内容"
+        )
+        return f"grsai 审核未通过：{where}被判定违规，请调整后重试。" + (f"（{detail}）" if detail else "")
+    compact = detail.lower().replace(" ", "")
+    if compact.startswith("apikey"):
+        return f"grsai 拒绝了 API Key（{detail}）。请确认填的是 grsai 控制台里的 Key，且复制完整。"
+    if compact.startswith("modelnotregister"):
+        return f"grsai 没有这个模型（{detail}），请检查模型 ID。"
+    return f"grsai 生成失败：{detail or '无错误描述'}"
+
+
+def grsai_result_urls(payload: dict[str, Any]) -> list[str]:
+    urls = [
+        str(item.get("url"))
+        for item in (payload.get("results") or [])
+        if isinstance(item, dict) and item.get("url")
+    ]
+    if not urls and payload.get("url"):
+        urls = [str(payload["url"])]  # 旧版字段，等于 results 的第一项
+    return urls
+
+
+def grsai_submit_task(
+    client: httpx.Client,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """提交生成任务，返回含任务 id 的响应。"""
+    response = client.post(url, headers=headers, json=body)
+    payload = grsai_payload(response)
+    status = str(payload.get("status") or "").strip().lower()
+    if response.status_code >= 400 or status in {"failed", "violation"}:
+        raise RuntimeError(grsai_failure_message(payload))
+    if not payload.get("id"):
+        raise RuntimeError("提交任务失败：grsai 返回里没有任务 id。")
+    return payload
+
+
+def grsai_wait_for_task(
+    client: httpx.Client,
+    api_key: str,
+    api_base_url: str,
+    task_id: str,
+) -> list[str]:
+    """轮询任务直到成功或失败，返回结果图片的 URL 列表。"""
+    started = perf_counter()
+    network_errors = 0
+    last_progress = ""
+    while True:
+        threading.Event().wait(GRSAI_POLL_INTERVAL_SECONDS)
+        elapsed = perf_counter() - started
+        try:
+            response = client.get(
+                grsai_url(api_base_url, GRSAI_RESULT_PATH),
+                headers=grsai_headers(api_key),
+                params={"id": task_id},
+            )
+            if response.status_code >= 500:
+                raise httpx.TransportError(f"HTTP {response.status_code}")
+        except httpx.TransportError:
+            # 任务已提交、已计费，网络抖一下不该让这张图作废。
+            network_errors += 1
+            if network_errors >= GRSAI_POLL_MAX_NETWORK_ERRORS:
+                raise
+            continue
+        network_errors = 0
+
+        payload = grsai_payload(response)
+        status = str(payload.get("status") or "").strip().lower()
+        if payload.get("progress") is not None:
+            last_progress = f"，进度 {payload.get('progress')}%"
+        if status == "succeeded":
+            urls = grsai_result_urls(payload)
+            if not urls:
+                raise RuntimeError("任务已完成，但结果里没有图片链接。")
+            return urls
+        if status in {"failed", "violation"}:
+            raise RuntimeError(grsai_failure_message(payload))
+        if not status:
+            # “结果不存在”：刚提交时可能还没登记，超过宽限期仍查不到才算失败。
+            if elapsed > GRSAI_RESULT_GRACE_SECONDS:
+                detail = payload.get("error") or payload.get("msg") or "无描述"
+                raise RuntimeError(f"查询不到任务结果：{detail}")
+        elif status != "running":
+            raise RuntimeError(f"任务返回了未知状态：{status}")
+        if elapsed > GRSAI_POLL_TIMEOUT_SECONDS:
+            raise RuntimeError(
+                f"等待任务超时（{GRSAI_POLL_TIMEOUT_SECONDS // 60} 分钟{last_progress}）。"
+                "任务可能仍在 grsai 后台运行，可到其控制台的日志里查看。"
+            )
+
+
+def pick_supported_resolution(resolution: str, supported: set[str]) -> str:
+    """在模型支持的档位里选最接近的：优先不超过所选档位的最高一档，否则取最低一档。"""
+    order = ["1K", "2K", "4K"]
+    wanted = "1K" if resolution == "512" else resolution  # 512 档按 1K 出图，再本地缩小
+    if wanted in supported:
+        return wanted
+    available = [item for item in order if item in supported] or ["1K"]
+    lower = [item for item in available if order.index(item) <= order.index(wanted)] if wanted in order else []
+    return lower[-1] if lower else available[0]
+
+
+def generate_grsai_image(
+    api_key: str,
+    proxy_url: str,
+    api_base_url: str,
+    model_id: str,
+    prompt: str,
+    reference_paths: list[str] | None,
+    resolution: str,
+    api_aspect_ratio: str | None,
+    quality: str = "auto",
+    keep_alpha: bool = False,
+    transparent_background: bool = False,
+) -> tuple[Image.Image, str | None]:
+    """走 grsai 的异步任务：提交（参考图以 base64 内联）→ 轮询 → 下载结果。"""
+    spec = grsai_model_spec(model_id)
+    references = list(reference_paths or [])
+    notes: list[str] = []
+
+    image_size = pick_supported_resolution(resolution, set(spec["resolutions"]))
+    if image_size != ("1K" if resolution == "512" else resolution):
+        notes.append(
+            f"`{model_id}` 不支持 `{resolution}`，已按 `{image_size}` 出图"
+            f"（该模型支持 {'/'.join(item for item in ('1K', '2K', '4K') if item in spec['resolutions'])}）。"
+        )
+
+    body: dict[str, Any] = {"model": model_id, "prompt": prompt, "replyType": "async"}
+    requested_pixels: str | None = None
+    if spec["family"] == "gpt":
+        if spec.get("pixel_sizes"):
+            # 高阶 GPT Image 不认比例，只认像素值，按文档对照表换算。
+            sizes = GRSAI_GPT_PIXEL_SIZES.get(api_aspect_ratio or "")
+            requested_pixels = sizes[GRSAI_PIXEL_SIZE_INDEX[image_size]] if sizes else None
+            body["aspectRatio"] = requested_pixels or "auto"
+        else:
+            body["aspectRatio"] = api_aspect_ratio or "auto"
+        clean_quality = (quality or "auto").strip().lower()
+        allowed = set(spec.get("qualities") or set())
+        if clean_quality not in {"", "auto"}:
+            if clean_quality in allowed:
+                body["quality"] = clean_quality
+            else:
+                supported = "/".join(item for item in QUALITY_CHOICES if item in allowed)
+                notes.append(
+                    f"`{model_id}` "
+                    + (f"只支持 quality {supported}" if supported else "不支持调整 quality")
+                    + f"，`{clean_quality}` 未发送，按默认质量出图。"
+                )
+        if transparent_background and spec.get("background"):
+            body["background"] = "transparent"
+    else:
+        body["aspectRatio"] = api_aspect_ratio or "auto"
+        body["imageSize"] = image_size
+
+    with make_httpx_client(proxy_url) as client:
+        generate_url = grsai_url(api_base_url, GRSAI_GENERATE_PATH)
+        headers = grsai_headers(api_key)
+        items: list[tuple[str, bytes, str]] = []
+        if references:
+            def with_images(parts: list[tuple[str, bytes, str]]) -> dict[str, Any]:
+                return {**body, "images": [bytes_to_data_url(data, mime) for _, data, mime in parts]}
+
+            items, upload_note = prepare_reference_uploads(
+                client, generate_url, headers, "json", references,
+                lambda parts: request_body_size(
+                    client.build_request("POST", generate_url, headers=headers, json=with_images(parts))
+                ),
+            )
+            if upload_note:
+                notes.append(upload_note)
+            body = with_images(items)
+
+        try:
+            created = grsai_submit_task(client, generate_url, headers, body)
+        except RuntimeError as exc:
+            # 文档只写“支持 base64”，没说要不要 data: 前缀；参考图被拒时换裸 base64 再试一次。
+            if not items or not re.search(r"base64|decode|images|图片", str(exc), re.I):
+                raise
+            body["images"] = [base64.b64encode(data).decode("ascii") for _, data, _ in items]
+            created = grsai_submit_task(client, generate_url, headers, body)
+
+        result_urls = grsai_result_urls(created)
+        if str(created.get("status") or "").lower() != "succeeded" or not result_urls:
+            result_urls = grsai_wait_for_task(client, api_key, api_base_url, str(created["id"]))
+        downloaded = client.get(result_urls[0])
+        if downloaded.status_code >= 400:
+            raise RuntimeError(f"下载生成结果失败：HTTP {downloaded.status_code}")
+        image = Image.open(BytesIO(downloaded.content))
+        image.load()
+
+    if keep_alpha and image.mode in ("RGBA", "LA", "P"):
+        image = image.convert("RGBA")
+    else:
+        image = image.convert("RGB")
+
+    requested_longest = (
+        size_to_longest_side(requested_pixels)
+        if requested_pixels
+        else LONGEST_SIDE_BY_RESOLUTION.get(image_size)
+    )
+    if requested_longest and max(image.size) < requested_longest:
+        notes.append(
+            f"请求 `{requested_pixels or image_size}`，实际只返回 `{image.size[0]}x{image.size[1]}`；"
+            "已按真实像素保存，未做本地放大。"
+        )
+    return image, ("\n\n".join(notes) or None)
+
+
+def grsai_credits(api_key: str, proxy_url: str, api_base_url: str) -> int:
+    """查询这个 API Key 的积分余额（不扣费），顺带验证 Key 是否有效。"""
+    with make_httpx_client(proxy_url) as client:
+        payload = grsai_payload(
+            client.post(
+                grsai_url(api_base_url, GRSAI_CREDITS_PATH),
+                headers={"Content-Type": "application/json"},
+                json={"apiKey": normalize_api_key(api_key)},
+            )
+        )
+    data = payload.get("data")
+    if payload.get("code") != 0 or not isinstance(data, dict):
+        raise RuntimeError(f"grsai 拒绝了 API Key：{payload.get('msg') or '无错误描述'}")
+    return int(data.get("credits") or 0)
+
+
+def grsai_unavailable_models(proxy_url: str, api_base_url: str) -> dict[str, str]:
+    """查询内置模型里 grsai 标记为异常（维护中、已下架）的，返回 {模型: 原因}。"""
+    unavailable: dict[str, str] = {}
+    with make_httpx_client(proxy_url) as client:
+        for model_id in GRSAI_MODEL_SPECS:
+            try:
+                payload = grsai_payload(
+                    client.get(
+                        grsai_url(api_base_url, GRSAI_MODEL_STATUS_PATH),
+                        params={"model": model_id},
+                        timeout=15,
+                    )
+                )
+            except Exception:
+                continue  # 状态查不到不代表模型不能用，不下结论
+            data = payload.get("data")
+            if payload.get("code") != 0:
+                unavailable[model_id] = str(payload.get("msg") or "grsai 不认识该模型")
+            elif isinstance(data, dict) and data.get("status") is False:
+                unavailable[model_id] = str(data.get("error") or "状态异常")
+    return unavailable
+
+
 def generate_openai_image(
     api_key: str,
     proxy_url: str,
@@ -2667,6 +3100,28 @@ def resolve_aspect_ratio(model_id: str, aspect_ratio: str) -> tuple[str | None, 
     return None, True
 
 
+def nearest_aspect_ratio(aspect_ratio: str, candidates: set[str]) -> str | None:
+    """在候选比例里找与目标最接近的一个（按两者比值的倍数衡量）。"""
+    def ratio_value(text: str) -> float:
+        width, height = parse_ratio(text)
+        return width / height
+
+    try:
+        target = ratio_value(aspect_ratio)
+    except (ValueError, ZeroDivisionError):
+        return None
+    best: tuple[float, str] | None = None
+    for candidate in sorted(candidates):
+        try:
+            value = ratio_value(candidate)
+        except (ValueError, ZeroDivisionError):
+            continue
+        gap = max(value / target, target / value)
+        if best is None or gap < best[0]:
+            best = (gap, candidate)
+    return best[1] if best else None
+
+
 def resolve_protocol_aspect_ratio(
     api_protocol: str,
     model_id: str,
@@ -2682,6 +3137,12 @@ def resolve_protocol_aspect_ratio(
         if aspect_ratio in kie_model_spec(model_id).get("aspects", set()):
             return aspect_ratio, False
         return None, True  # 非原生比例：让模型自行决定，再本地裁切
+    if protocol == API_PROTOCOL_GRSAI:
+        aspects = set(grsai_model_spec(model_id)["aspects"])
+        if aspect_ratio in aspects:
+            return aspect_ratio, False
+        # 非原生比例：按最接近的原生比例出图再本地裁切，裁掉的最少。
+        return nearest_aspect_ratio(aspect_ratio, aspects), True
     if protocol == API_PROTOCOL_OPENAI_CHAT:
         return None, True
     # 已登记能力的模型（VIP、RollDek 系列）直接按其原生比例表判断，避免无谓的本地裁切。
@@ -4035,6 +4496,16 @@ def test_connection_handler(
         raise gr.Error("请先填写 API Key。")
     try:
         protocol = normalize_api_protocol(api_protocol)
+        if protocol == API_PROTOCOL_GRSAI:
+            # grsai 没有模型列表接口，改查积分余额：不扣费，又能确认 Key 有效。
+            credits = grsai_credits(api_key, proxy_url, api_base_url)
+            message = (
+                f"连接测试成功：grsai 已认出这个 API Key，积分余额 {credits:,}"
+                f"（约 ¥{credits / GRSAI_CREDITS_PER_YUAN:.2f}）；"
+                f"当前节点 `{grsai_url(api_base_url, '')}`。"
+            )
+            gr.Info(message)
+            return message
         model_ids = list_available_models(api_key, proxy_url, api_base_url, protocol)
         endpoint_note = (
             f"自定义 Base URL：`{normalize_api_base_url(api_base_url)}`"
@@ -4091,6 +4562,8 @@ def list_available_models(
     if protocol == API_PROTOCOL_KIE:
         # kie.ai 没有提供列出模型的接口，返回内置清单；下拉框支持直接输入其它模型 ID。
         return list(KIE_MODEL_SPECS)
+    if protocol == API_PROTOCOL_GRSAI:
+        return list(GRSAI_MODEL_SPECS)  # 同样没有列出模型的接口
     if protocol == API_PROTOCOL_GEMINI:
         client = make_client(api_key, proxy_url, api_base_url)
         raw_ids = []
@@ -4130,6 +4603,9 @@ def build_model_choices(model_ids: list[str]) -> list[tuple[str, str]]:
 def get_initial_model_choices(api_protocol: str = API_PROTOCOL_GEMINI) -> list[tuple[str, str]]:
     """启动时的模型下拉选项：优先用上次检测结果，否则用内置列表。"""
     protocol = normalize_api_protocol(api_protocol)
+    if protocol == API_PROTOCOL_GRSAI:
+        # grsai 的模型 ID 和 RollDek / kie.ai 有重名，不能共用 MODEL_BY_ID 的名称。
+        return grsai_model_choices()
     detected = load_available_models(protocol)
     if detected:
         return build_model_choices(detected)
@@ -4162,6 +4638,14 @@ def refresh_protocol_ui(
             f"`{KIE_DEFAULT_BASE_URL}`。kie.ai 没有列出模型的接口，下拉框是内置清单，"
             "其它模型可直接在下拉框里输入 ID。生成是异步的：提交任务后会自动轮询结果，"
             "因此首张图通常比其它协议慢一些。"
+        )
+    elif protocol == API_PROTOCOL_GRSAI:
+        hint = (
+            f"已切换到 **{protocol_display_name(protocol)}**。Base URL 留空（或填的不是 grsai 地址）"
+            f"时使用全球节点 `{GRSAI_DEFAULT_BASE_URL}`；国内直连可填 `{GRSAI_CN_BASE_URL}`。"
+            "API Key 在 grsai 控制台的 API Key 页面创建。“测试连接”会显示积分余额，"
+            "“检测可用模型”会标出 grsai 正在维护或已下架的模型。生成是异步的：提交任务后自动轮询结果。"
+            "quality 只对 GPT Image 系列生效。"
         )
     else:
         endpoint = "Google 官方端点" if is_gemini else "OpenAI 官方端点"
@@ -4204,6 +4688,8 @@ def detect_models_handler(
         raise gr.Error("请先填写 API Key。")
     try:
         protocol = normalize_api_protocol(api_protocol)
+        if protocol == API_PROTOCOL_GRSAI:
+            return detect_grsai_models(proxy_url, api_base_url, current_model)
         all_ids = list_available_models(api_key, proxy_url, api_base_url, protocol)
     except Exception as exc:
         raise gr.Error(f"检测失败：{map_error_message(exc)}") from exc
@@ -4237,6 +4723,39 @@ def detect_models_handler(
     )
     gr.Info(status)
 
+    row_updates = [gr.update(choices=choices) for _ in range(MAX_BATCH_ROWS)]
+    return (
+        status,
+        gr.update(choices=choices, value=creative_value),
+        gr.update(choices=choices),
+        gr.update(choices=choices, value=creative_value),
+        gr.update(choices=choices, value=creative_value),
+        *row_updates,
+    )
+
+
+def detect_grsai_models(
+    proxy_url: str,
+    api_base_url: str,
+    current_model: str | None,
+) -> tuple[Any, ...]:
+    """grsai 没有模型列表接口：内置清单逐个查状态，把维护中 / 已下架的标出来。
+
+    不写入检测缓存——状态随时会恢复，而缓存会让以后新版本增加的模型显示不出来。
+    """
+    unavailable = grsai_unavailable_models(proxy_url, api_base_url)
+    choices = grsai_model_choices(unavailable)
+    values = [value for _, value in choices]
+    creative_value = current_model if current_model in values else values[0]
+    if unavailable:
+        listed = "；".join(f"`{model_id}`：{reason}" for model_id, reason in unavailable.items())
+        status = (
+            f"✅ grsai 内置 {len(values)} 个图像模型，其中 {len(unavailable)} 个暂不可用（{listed}），"
+            "已在下拉框里标注。其它模型 ID 仍可直接输入。"
+        )
+    else:
+        status = f"✅ grsai 内置 {len(values)} 个图像模型，状态均正常。其它模型 ID 仍可直接输入。"
+    gr.Info(status)
     row_updates = [gr.update(choices=choices) for _ in range(MAX_BATCH_ROWS)]
     return (
         status,
@@ -4516,6 +5035,20 @@ def generate_handler(
                 )
                 if kie_note and kie_note not in resolution_notes:
                     resolution_notes.append(kie_note)
+            elif protocol == API_PROTOCOL_GRSAI:
+                image, grsai_note = generate_grsai_image(
+                    api_key=api_key,
+                    proxy_url=proxy_url,
+                    api_base_url=api_base_url,
+                    model_id=model_id,
+                    prompt=effective_prompt,
+                    reference_paths=reference_paths,
+                    resolution=resolution,
+                    api_aspect_ratio=api_aspect_ratio,
+                    quality=quality,
+                )
+                if grsai_note and grsai_note not in resolution_notes:
+                    resolution_notes.append(grsai_note)
             elif protocol == API_PROTOCOL_OPENAI_CHAT:
                 image = generate_openai_chat_image(
                     api_key=api_key,
@@ -4578,7 +5111,7 @@ def generate_handler(
             )
             elapsed = perf_counter() - request_start
             caption = build_gallery_caption(
-                model_label=MODEL_LABELS.get(model_id, model_id),
+                model_label=model_display_label(protocol, model_id),
                 prompt=clean_prompt,
                 seed=image_seed,
                 elapsed_seconds=elapsed,
@@ -5494,6 +6027,20 @@ def batch_generate_handler(
                         )
                         if kie_note and kie_note not in row_notes:
                             row_notes.append(kie_note)
+                    elif protocol == API_PROTOCOL_GRSAI:
+                        image, grsai_note = generate_grsai_image(
+                            api_key=api_key,
+                            proxy_url=proxy_url,
+                            api_base_url=api_base_url,
+                            model_id=task["model_id"],
+                            prompt=effective_prompt,
+                            reference_paths=task["reference_paths"],
+                            resolution=task["resolution"],
+                            api_aspect_ratio=api_aspect_ratio,
+                            quality=task["quality"],
+                        )
+                        if grsai_note and grsai_note not in row_notes:
+                            row_notes.append(grsai_note)
                     elif protocol == API_PROTOCOL_OPENAI_CHAT:
                         image = generate_openai_chat_image(
                             api_key=api_key,
@@ -5548,7 +6095,7 @@ def batch_generate_handler(
                     )
                     elapsed = perf_counter() - request_start
                     caption = build_gallery_caption(
-                        model_label=MODEL_LABELS.get(task["model_id"], task["model_id"]),
+                        model_label=model_display_label(protocol, task["model_id"]),
                         prompt=prompt,
                         seed=image_seed,
                         elapsed_seconds=elapsed,
@@ -5781,6 +6328,21 @@ def run_protocol_image_edit(
             resolution="1K",
             api_aspect_ratio=None,
             keep_alpha=keep_alpha,
+        )
+        return edited_image
+    if protocol == API_PROTOCOL_GRSAI:
+        edited_image, _ = generate_grsai_image(
+            api_key=api_key,
+            proxy_url=proxy_url,
+            api_base_url=api_base_url,
+            model_id=model_id,
+            prompt=prompt,
+            reference_paths=image_paths,
+            resolution="1K",
+            api_aspect_ratio=None,
+            keep_alpha=keep_alpha,
+            # 去背要透明底时，支持 background 参数的 GPT Image 模型直接出透明图。
+            transparent_background=keep_alpha,
         )
         return edited_image
     if protocol == API_PROTOCOL_OPENAI_CHAT:
